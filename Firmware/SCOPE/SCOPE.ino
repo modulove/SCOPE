@@ -24,6 +24,10 @@
 
 // Flag for reversing the encoder direction.
 // #define ENCODER_REVERSED
+
+// Flag for using module upside down
+// #define PANEL_USD
+
 #include <EEPROM.h>
 
 // EEPROM addresses
@@ -96,6 +100,11 @@ void setup() {
   delay(500);  // delay for display init
   // display setting
   display.begin(SSD1306_SWITCHCAPVCC);
+  #ifdef PANEL_USD
+  display.setRotation(2);  // 180 degree rotation for upside-down use
+  #else
+  display.setRotation(0);  // Normal orientation
+  #endif
   display.clearDisplay();
   display.setTextSize(0);
   display.setTextColor(WHITE);
