@@ -1,3 +1,29 @@
+/**
+ * @file SCOPE.ino
+ * @author Modulove & friends (https://github.com/modulove/)
+ * @brief HAGIWO simple Arduino-based OLED Display Eurorack module
+ * @version 0.1
+ * @date 2024-04-30
+ *
+ * @copyright Copyright (c) 2024
+ *
+ * Connect a clock source to the CLK input and each output will
+ * output triggers according to settings set in the UI OLED screen
+ *
+ * Encoder:
+ *      short press: Toggle between menue options (dial in values with rotation)
+  *
+ *
+ * RST: Trigger this input to reset the Display.
+ *
+ */
+
+// Flag for enabling debug print to serial monitoring output.
+// Note: this affects performance and locks LED 4 & 5 on HIGH.
+// #define DEBUG
+
+// Flag for reversing the encoder direction.
+// #define ENCODER_REVERSED
 #include <EEPROM.h>
 
 // EEPROM addresses
@@ -30,7 +56,11 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT,
 //rotery encoder setting
 #define ENCODER_OPTIMIZE_INTERRUPTS  //contermeasure of rotery encoder noise
 #include <Encoder.h>
-Encoder myEnc(2, 4);       //rotery encoder digitalRead pin
+#ifdef ENCODER_REVERSED
+Encoder myEnc(4, 2);  // 2pin, 4pin is default
+#else
+Encoder myEnc(2, 4);                          // 3pin, 2pin is default
+#endif
 float oldPosition = -999;  //rotery encoder counter
 float newPosition = -999;
 
