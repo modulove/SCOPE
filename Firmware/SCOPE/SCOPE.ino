@@ -164,11 +164,8 @@ const unsigned char Modulove_Logo [] PROGMEM = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
 
-// Array of all bitmaps for convenience. (Total bytes used to store images in PROGMEM = 1040)
-const int myBitmapallArray_LEN = 1;
-const unsigned char* myBitmapallArray[1] = {
-	Modulove_Logo
-};
+//(Total bytes used to store images in PROGMEM = 1040)
+
 
 const int width = 128;
 const int height = 64;
