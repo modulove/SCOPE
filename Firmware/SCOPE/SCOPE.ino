@@ -1,9 +1,9 @@
 /**
  * @file SCOPE.ino
- * @author Modulove & friends (https://github.com/modulove/)
- * @brief Eurorack scope / OLED Display (new config menu (≥3s))
+ * @author Modulove
+ * @brief Eurorack scope + OLED flip
  * @version 1.1
- * @date 2025-10-15
+ * @date 2025-11-29
  */
 
 #include <EEPROM.h>
@@ -17,7 +17,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-// ---------------- Display configuration ----------------
+// ---------------- Display  ----------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_MOSI 9
@@ -39,13 +39,13 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_
 
 Encoder encoder(ENCODER_PIN_A, ENCODER_PIN_B);
 
-// ---------------- EEPROM map ----------------
-// add OLED rotation.
-#define ENCODER_DIR_ADDR      0   // int8_t  (1 or -1)
-#define OLED_ROT_ADDR         1   // uint8_t (0 or 2)
-#define MENUTIMER_DIR_ADDR    2   // uint8_t (1..60)
-const int EEPROM_MODE_ADDR = 4;   // uint8_t
-const int EEPROM_PARAM_SELECT_ADDR = 5; // per-mode bank starts here (5..16 used for 4 modes)
+// ---------------- EEPROM ----------------
+//  OLED rotation.
+#define ENCODER_DIR_ADDR      0
+#define OLED_ROT_ADDR         1
+#define MENUTIMER_DIR_ADDR    2
+const int EEPROM_MODE_ADDR = 4;
+const int EEPROM_PARAM_SELECT_ADDR = 5;
 
 // ---------------- Modes ----------------
 #define MODE_LFO      1
@@ -53,7 +53,7 @@ const int EEPROM_PARAM_SELECT_ADDR = 5; // per-mode bank starts here (5..16 used
 #define MODE_SHOT     3
 #define MODE_SPECTRUM 4
 
-// ---------------- Boot logo  ----------------
+// ---------------- Boot logo (PROGMEM) ----------------
 const unsigned char Modulove_Logo [] PROGMEM = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 
@@ -110,7 +110,7 @@ int rfrs = 0;
 float oldPosition = -999;
 float newPosition = -999;
 
-// Secret menu
+// config menu
 bool encoderPressed = false;
 bool secretMenuActive = false;
 unsigned long enterPressStartTime = 0;
@@ -127,9 +127,8 @@ union {
 } buffer;
 
 // ------------- Optional: WebScope flag -------------
-volatile bool webscopeEnabled = false; // set by serial command later
+volatile bool webscopeEnabled = false;
 
-// ---------------- Prototypes ----------------
 void drawBootAnimation();
 void setupMode(uint8_t mode);
 void runLFOMode(bool showParams);
@@ -167,7 +166,7 @@ void setup() {
   display.setTextColor(WHITE);
 
   drawBootAnimation();
-  delay(1000);
+  delay(800);
 
   // I/O
   pinMode(OFFSET_PIN, OUTPUT);
@@ -182,7 +181,7 @@ void setup() {
   loadSettings();
   setupMode(mode);
 
-  // (Optional) Serial for WebSerial features
+  // (Optional) WebSerial features
   // Serial.begin(115200);
 }
 
@@ -229,7 +228,7 @@ void loop() {
   // ---------- Normal operation ----------
   newPosition = encoderDirection * encoder.read();
 
-  // Button: cycle through parameter “slots” like original
+  // Button: cycle through parameter “slots” 
   if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
   else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
 
@@ -276,7 +275,7 @@ void loop() {
 
   display.display();
 
-  // (Optional) web scope streaming could go here if enabled
+  // (Optional) web scope streaming 
   // if (webscopeEnabled) { /* stream a decimated frame over Serial */ }
 }
 
@@ -301,7 +300,7 @@ void setupMode(uint8_t m) {
   switch (m) {
     case MODE_LFO:
       param1 = (saved_param1 >= 1 && saved_param1 <= 8) ? saved_param1 : 4; // Time
-      param2 = (saved_param2 >= 1 && saved_param2 <= 8) ? saved_param2 : 1; // Offset
+      param2 = (saved_param2 >= -6 && saved_param2 <= 10) ? saved_param2 : 1; // Offset
       pinMode(FILTER_PIN, INPUT);
       analogWrite(OFFSET_PIN, 0);
       ADCSRA = (ADCSRA & 0xF8) | 0x04; // prescaler /16 (fast)
@@ -341,11 +340,11 @@ void setupMode(uint8_t m) {
 void runLFOMode(bool showParams) {
   param  = constrain(param, 1, 3);
   param1 = constrain(param1, 1, 8);  // Time scale
-  param2 = constrain(param2, 1, 8);  // Vertical offset
+  param2 = constrain(param2, -6, 10);  // Vertical offset
 
   uint8_t currentSample = analogRead(ANALOG_INPUT_PIN) >> 4; // 0..63
 
-  // Scroll waveform (faster than for-loop)
+  // Scroll waveform 
   memmove(&buffer.waveform[1], &buffer.waveform[0], 127);
   buffer.waveform[0] = currentSample;
 
@@ -354,8 +353,8 @@ void runLFOMode(bool showParams) {
     lastDraw = millis();
     display.clearDisplay();
 
-    int step = (9 - param1);          // 8..1
-    int voff = (param2 - 1) * 4;      // 0..28
+    int step = (9 - param1);
+    int voff = (param2 - 1) * 6;
     int segments = 126 / step;
 
     for (int i = 0; i < segments; i++) {
@@ -523,7 +522,7 @@ void drawParameterBar(bool showParams) {
   }
 }
 
-// ---------------- config menu (incl OLED rotation) ----------------
+// ---------------- config menu (new: OLED rotation) ----------------
 void secretMenu() {
   int newDirection = encoderDirection;
   newPosition = encoder.read();
@@ -598,34 +597,35 @@ void secretMenu() {
   display.setCursor(0, 0);
   display.setTextColor(WHITE);
   display.println(F("GLOBAL SETTINGS"));
+  display.println();
 
   // 1) Encoder direction
   display.setTextColor(secretMenuOption == 1 ? BLACK : WHITE, secretMenuOption == 1 ? WHITE : BLACK);
-  display.println(F("Encoder Direction:"));
+  display.print(F("Encoder: "));
   display.setTextColor(WHITE);
-  display.println(encoderDirection == 1 ? F("Normal") : F("Reversed"));
+  display.print(encoderDirection == 1 ? (" Normal") : (" Reversed"));
   display.println();
 
   // 2) Menu timer
   display.setTextColor(secretMenuOption == 2 ? BLACK : WHITE, secretMenuOption == 2 ? WHITE : BLACK);
-  display.println(F("Menu Timer:"));
+  display.print(F("Timer: "));
   display.setTextColor(WHITE);
-  display.print(menuTimer); display.println(F(" s"));
+  display.print(menuTimer); display.print((" s"));
   display.println();
 
   // 3) OLED Rotation
   display.setTextColor(secretMenuOption == 3 ? BLACK : WHITE, secretMenuOption == 3 ? WHITE : BLACK);
-  display.println(F("OLED Rotation:"));
+  display.print(F("OLED: "));
   display.setTextColor(WHITE);
-  display.println(oledRotation == 0 ? F("0 deg") : F("180 deg"));
+  display.print(oledRotation == 0 ? (" 0 deg") : (" 180 deg"));
 
   // Exit bar
   if (exitProgress > 0) {
-    display.drawRect(0, 56, 128, 8, WHITE);
-    display.fillRect(2, 58, (exitProgress * 124) / 100, 4, WHITE);
-    display.setCursor(0, 48); display.print(F("Hold to save & exit"));
+    display.drawRect(0, 54, 128, 8, WHITE);
+    display.fillRect(2, 56, (exitProgress * 124) / 100, 4, WHITE);
+    display.setCursor(4, 44); display.print(F("Hold to save & exit"));
   } else {
-    display.setCursor(0, 56); display.print(F("Hold button to exit"));
+    display.setCursor(4, 52); display.print(F("Hold button to exit"));
   }
   display.display();
 }
