@@ -1,79 +1,59 @@
 /**
  * @file SCOPE.ino
- * @author Modulove & friends (https://github.com/modulove/)
- * @brief HAGIWO simple Arduino-based OLED Display Eurorack module
- * @version 1
- * @date 2025-14-03
- *
- * @copyright Copyright (c) 2025
- *
- * Optimized Oscilloscope/Spectrum Analyzer
- * Improved version with better memory usage and code structure
- *
- * Encoder:
- *          short press: Toggle between menue options (dial in values with rotation)
- *          medium press 1-2 seconds: Save current mode parameters to EEPROM and remember last mode
- *          long press >3 seconds: Enter & Exit Global Settings Menu
- *
- * Global Settings Menu:
- *                      Encoder Driection: Normal or Reverse
- *                      Menu Timer: 1-60 seconds (hides menu when not in use)
- *
+ * @author Modulove
+ * @brief Eurorack scope + OLED flip
+ * @version 1.1
+ * @date 2025-11-29
  */
 
-// Flag for using module upside down
-// #define PANEL_USD
-
 #include <EEPROM.h>
-#include <avr/io.h>   // For fast PWM
-#include "fix_fft.h"  // Spectrum analysis
+#include <avr/io.h>
+#include "fix_fft.h"
 #include <Encoder.h>
-
-// OLED display setting
 #include <SPI.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
 
-// Display configuration
-#define SCREEN_WIDTH 128       // OLED display width, in pixels
-#define SCREEN_HEIGHT 64       // OLED display height, in pixels
+// ---------------- Display  ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
 #define OLED_MOSI 9
 #define OLED_CLK 10
 #define OLED_DC 11
 #define OLED_CS 12
 #define OLED_RESET 13
 
-// Pin definitions
-#define ENCODER_PIN_A 2
-#define ENCODER_PIN_B 4
-#define BUTTON_PIN 5
-#define FILTER_PIN 6
-#define TRIGGER_PIN 7
-#define OFFSET_PIN 3
-#define ANALOG_INPUT_PIN 0
-
-// EEPROM addresses
-#define ENCODER_DIR_ADDR 0        // EEPROM address to store the encoder direction
-#define MENUTIMER_DIR_ADDR 2      // EEPROM address to store the menuTimer direction
-const int EEPROM_MODE_ADDR = 4;
-const int EEPROM_PARAM_SELECT_ADDR = 5;
-const int EEPROM_PARAM_ADDR = 6;
-const int EEPROM_PARAM1_ADDR = 7;
-const int EEPROM_PARAM2_ADDR = 8;
-
-// Mode definitions
-#define MODE_LFO 1                // Low frequency oscilloscope
-#define MODE_WAVE 2               // High frequency oscilloscope
-#define MODE_SHOT 3               // Mid freq oscilloscope with external trig
-#define MODE_SPECTRUM 4           // Spectrum analyzer
-
-// Initialize the OLED display
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, OLED_MOSI, OLED_CLK, OLED_DC, OLED_RESET, OLED_CS);
 
-// Initialize the rotary encoder
+// ---------------- Pins ----------------
+#define ENCODER_PIN_A 2
+#define ENCODER_PIN_B 4
+#define BUTTON_PIN    5
+#define FILTER_PIN    6
+#define TRIGGER_PIN   7
+#define OFFSET_PIN    3
+#define ANALOG_INPUT_PIN 0
+
 Encoder encoder(ENCODER_PIN_A, ENCODER_PIN_B);
 
-// 'Modulove_Logo', 128x30px // Optimized Boot Logo
+// ---------------- EEPROM ----------------
+//  OLED rotation.
+#define ENCODER_DIR_ADDR      0
+#define OLED_ROT_ADDR         1
+#define MENUTIMER_DIR_ADDR    2
+const int EEPROM_MODE_ADDR = 4;
+const int EEPROM_PARAM_SELECT_ADDR = 5;
+
+// ---------------- Modes ----------------
+#define MODE_LFO      1
+#define MODE_WAVE     2
+#define MODE_SHOT     3
+#define MODE_SPECTRUM 4
+
+// ---------------- Boot logo (PROGMEM) ----------------
 const unsigned char Modulove_Logo [] PROGMEM = {
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 
@@ -107,51 +87,48 @@ const unsigned char Modulove_Logo [] PROGMEM = {
 	0x00, 0x0e, 0x00, 0x00, 0x30, 0xe0, 0xc3, 0x18, 0x60, 0xc0, 0xc0, 0x40, 0x0f, 0xe0, 0x00, 0x00
 };
 
-// Logo dimensions
-const int logoWidth = 128;  // Keep full width
-const int logoHeight = 30;  // Reduced height
-const int yOffset = 14;     // Position in the original bitmap where content starts
+const int logoWidth = 128;
+const int logoHeight = 30;
+const int yOffset = 14;
 
-// Global variables
-uint8_t mode = 1;       // 1=low freq oscilo, 2=high freq oscilo, 3=mid freq oscilo with external trig, 4=spectrum analyze
-uint8_t old_mode = 1;   // For initial setting when mode change
+// ---------------- Globals ----------------
+uint8_t mode = MODE_LFO;
+uint8_t old_mode = MODE_LFO;
 uint8_t param_select = 0;
 uint8_t param = 1;
 uint8_t param1 = 2;
 uint8_t param2 = 1;
-bool trig = 0;      // External trigger
-bool old_trig = 0;  // External trigger, OFF -> ON detect
-bool old_SW = 0;    // Push switch, OFF -> ON detect
-bool SW = 0;        // Push switch
-unsigned long hideTimer = 0;  // Hide parameter count
-unsigned long saveTimer = 0;  // Save parameter count
-bool hide = 0;                // 1=hide, 0=not hide
-int rfrs = 0;  // Display refresh rate
 
-// For rotary encoder
-float oldPosition = -999;  // Rotary encoder counter
+bool trig = 0, old_trig = 0;
+bool SW = 0, old_SW = 0;
+
+unsigned long hideTimer = 0;
+unsigned long lastSaveTime = 0;
+bool hide = 0;
+int rfrs = 0;
+
+float oldPosition = -999;
 float newPosition = -999;
 
-// Secret menu variables
+// config menu
 bool encoderPressed = false;
 bool secretMenuActive = false;
-unsigned long enterPressStartTime = 0;  // Timer for entering the secret menu
-unsigned long exitPressStartTime = 0;   // Timer for exiting the secret menu
-byte secretMenuOption = 1;              // 1 for encoderDirection, 2 for menuTimer
-unsigned int menuTimer = 5;             // Default value for menuTimer, set to 5
-int encoderDirection = 1;               // 1 for normal, -1 for reversed
-unsigned long lastSaveTime = 0;
+unsigned long enterPressStartTime = 0;
+unsigned long exitPressStartTime  = 0;
+byte secretMenuOption = 1; // 1=encoder dir, 2=menu timer, 3=OLED rotation
+unsigned int menuTimer = 5; // seconds
+int encoderDirection = 1;   // 1 or -1
+uint8_t oledRotation = 0;   // 0 or 2 for SSD1306
 
-// Data buffers (using union to share memory)
+// Data buffer union
 union {
-  struct {
-    int8_t real[128];               // FFT real component
-    int8_t imag[128];               // FFT imaginary component
-  } spectrum;
-  uint8_t waveform[128];            // Oscilloscope waveform
+  struct { int8_t real[128]; int8_t imag[128]; } spectrum;
+  uint8_t waveform[128];
 } buffer;
 
-// Function declarations
+// ------------- Optional: WebScope flag -------------
+volatile bool webscopeEnabled = false;
+
 void drawBootAnimation();
 void setupMode(uint8_t mode);
 void runLFOMode(bool showParams);
@@ -159,793 +136,538 @@ void runWaveMode(bool showParams);
 void runShotMode(bool showParams);
 void runSpectrumMode(bool showParams);
 void drawParameterBar(bool showParams);
-void handleSecretMenu();
+void secretMenu();
 void saveSettings();
 void loadSettings();
 
+// ---------------- Setup ----------------
 void setup() {
-  // Load settings from EEPROM
+  // Load encoder direction
   EEPROM.get(ENCODER_DIR_ADDR, encoderDirection);
-  delay(10);
-  if (encoderDirection != 1 && encoderDirection != -1) {
-    encoderDirection = 1;  // Default to normal direction if EEPROM contains invalid data
-  }
+  if (encoderDirection != 1 && encoderDirection != -1) encoderDirection = 1;
 
+  // Load OLED rotation
+  oledRotation = EEPROM.read(OLED_ROT_ADDR);
+  if (!(oledRotation == 0 || oledRotation == 2)) oledRotation = 0;
+
+  // Load menu timer
   EEPROM.get(MENUTIMER_DIR_ADDR, menuTimer);
-  delay(10);
-  if (menuTimer < 1 || menuTimer > 30) {
-    menuTimer = 5;  // Default to 5 if menuTimer is invalid
-  }
+  if (menuTimer < 1 || menuTimer > 60) menuTimer = 5;
 
   // Load last mode
   uint8_t lastMode = EEPROM.read(EEPROM_MODE_ADDR);
-  if (lastMode >= MODE_LFO && lastMode <= MODE_SPECTRUM) {
-    mode = lastMode;
-  }
+  if (lastMode >= MODE_LFO && lastMode <= MODE_SPECTRUM) mode = lastMode;
 
-  // Initialize display
+  // Display init
   display.begin(SSD1306_SWITCHCAPVCC);
-  #ifdef PANEL_USD
-  display.setRotation(2);  // 180 degree rotation for upside-down use
-  #else
-  display.setRotation(0);  // Normal orientation
-  #endif
-
-  // Show boot animation
-  drawBootAnimation();
-  delay(2000);  // Show logo for 2 seconds
-
-  // Configure display
+  display.setRotation(oledRotation);   // runtime-applied
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(WHITE);
-  
-  // Configure I/O pins
-  pinMode(OFFSET_PIN, OUTPUT);        // Offset voltage
-  pinMode(BUTTON_PIN, INPUT_PULLUP);  // Push switch
-  pinMode(FILTER_PIN, INPUT);         // Input is high impedance -> no active 2-pole filter
-  pinMode(TRIGGER_PIN, INPUT);        // External trigger detect
 
-  // Configure Fast PWM
+  drawBootAnimation();
+  delay(800);
+
+  // I/O
+  pinMode(OFFSET_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(FILTER_PIN, INPUT);
+  pinMode(TRIGGER_PIN, INPUT);
+
+  // Fast PWM on Timer2
   TCCR2B &= B11111000;
   TCCR2B |= B00000001;
 
-  // Load settings for current mode
   loadSettings();
-  
-  // Set up hardware for current mode
   setupMode(mode);
+
+  // (Optional) WebSerial features
+  // Serial.begin(115200);
 }
 
+// ---------------- Loop ----------------
 void loop() {
   old_SW = SW;
   old_mode = mode;
-  // Read button state
-  SW = digitalRead(BUTTON_PIN) == LOW;
+  SW = (digitalRead(BUTTON_PIN) == LOW);
 
-  // Button timing logic
+  // Button timing
   static unsigned long buttonPressStart = 0;
   static bool isLongPressing = false;
   static bool hasSaved = false;
-  
-  // Track button press start time
+
   if (SW && !old_SW) {
     buttonPressStart = millis();
     isLongPressing = true;
     hasSaved = false;
   }
-  
-  // Check for button release
-  if (!SW && old_SW) {
-    isLongPressing = false;
-  }
-  
-  // Check for save condition: long press between 1-2 seconds
-  if (isLongPressing && !hasSaved && (millis() - buttonPressStart >= 1000) && (millis() - buttonPressStart < 3000)) {
-    saveSettings();
-    hasSaved = true; // Prevent multiple saves in one press
+  if (!SW && old_SW) isLongPressing = false;
+
+  // Medium press: save (1–3s)
+  if (isLongPressing && !hasSaved) {
+    unsigned long d = millis() - buttonPressStart;
+    if (d >= 1000 && d < 3000) {
+      saveSettings();
+      hasSaved = true;
+    }
   }
 
-  // Check for secret menu entry: very long press (≥3 seconds)
-  if (SW && !encoderPressed && !secretMenuActive && (millis() - buttonPressStart >= 3000)) {
+  // Very long press: enter config menu (≥3s)
+  if (SW && !secretMenuActive && (millis() - buttonPressStart >= 3000)) {
     secretMenuActive = true;
-    encoderPressed = false;  // Reset press state
-    secretMenuOption = 1;    // Reset to first option
-    oldPosition = newPosition = encoder.read();  // Reset encoder position
-  } else if (!SW && encoderPressed && !secretMenuActive) {
     encoderPressed = false;
+    secretMenuOption = 1;
+    oldPosition = newPosition = encoder.read();
   }
 
-  // Main logic branching
   if (secretMenuActive) {
     secretMenu();
-  } else {
-    // Main operation logic
-    // First read of encoder
-    newPosition = encoderDirection * encoder.read();
-
-    // Handle button press for parameter selection - EXACTLY like original code
-    // Ignore very short presses that might be from saving
-    if (old_SW == 0 && SW == 1 && param_select == param) {
-      param_select = 0;
-      hideTimer = millis();
-    } else if (old_SW == 0 && SW == 1 && param == 1) {
-      param_select = param;
-      hideTimer = millis();
-    } else if (old_SW == 0 && SW == 1 && param == 2) {
-      param_select = param;
-      hideTimer = millis();
-    } else if (old_SW == 0 && SW == 1 && param == 3) {
-      param_select = param;
-      hideTimer = millis();
-    }
-    
-    // Parameter constraints
-    mode = constrain(mode, 1, 4);
-    param = constrain(param, 1, 3);
-
-    // Second read of encoder - EXACTLY like original formula
-    newPosition = encoderDirection * encoder.read();
-
-    // Check for encoder rotation - EXACTLY like original formula
-    if ((newPosition - 3) / 4 > oldPosition / 4) {
-      oldPosition = newPosition;
-      hideTimer = millis();
-      
-      switch (param_select) {
-        case 0:
-          param--;
-          break;
-        case 1:
-          mode--;
-          break;
-        case 2:
-          param1--;
-          break;
-        case 3:
-          param2--;
-          break;
-      }
-    } else if ((newPosition + 3) / 4 < oldPosition / 4) {
-      oldPosition = newPosition;
-      hideTimer = millis();
-      
-      switch (param_select) {
-        case 0:
-          param++;
-          break;
-        case 1:
-          mode++;
-          break;
-        case 2:
-          param1++;
-          break;
-        case 3:
-          param2++;
-          break;
-      }
-    }
-
-    // Store the current param_select value before mode change
-    byte currentParamSelect = param_select;
-    
-    // Mode setup if changed
-    if (old_mode != mode) {
-      setupMode(mode);  // Load saved parameters for the new mode
-      display.clearDisplay();
-      
-      // IMPORTANT: Restore param_select to continue mode selection
-      if (currentParamSelect == 1) {
-        param_select = 1;  // Keep mode selection active
-      }
-      
-      // Reset the hide timer to ensure parameters remain visible after changing mode
-      hideTimer = millis();
-    }
-
-    // Determine if parameters should be shown
-    hide = (millis() - hideTimer >= (menuTimer * 1000));
-    bool showParams = !hide;
-
-    // Run appropriate mode
-    switch (mode) {
-      case MODE_LFO:
-        runLFOMode(showParams);
-        break;
-      case MODE_WAVE:
-        runWaveMode(showParams);
-        break;
-      case MODE_SHOT:
-        runShotMode(showParams);
-        break;
-      case MODE_SPECTRUM:
-        runSpectrumMode(showParams);
-        break;
-    }
-
-    display.display();
+    return;
   }
+
+  // ---------- Normal operation ----------
+  newPosition = encoderDirection * encoder.read();
+
+  // Button: cycle through parameter “slots” 
+  if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
+  else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
+
+  mode = constrain(mode, 1, 4);
+  param = constrain(param, 1, 3);
+
+  newPosition = encoderDirection * encoder.read();
+  if ((newPosition - 3) / 4 > oldPosition / 4) {
+    oldPosition = newPosition; hideTimer = millis();
+    switch (param_select) {
+      case 0: param--; break;
+      case 1: mode--;  break;
+      case 2: param1--;break;
+      case 3: param2--;break;
+    }
+  } else if ((newPosition + 3) / 4 < oldPosition / 4) {
+    oldPosition = newPosition; hideTimer = millis();
+    switch (param_select) {
+      case 0: param++; break;
+      case 1: mode++;  break;
+      case 2: param1++;break;
+      case 3: param2++;break;
+    }
+  }
+
+  // Keep “mode selecting” sticky while switching modes
+  byte currentParamSelect = param_select;
+  if (old_mode != mode) {
+    setupMode(mode);
+    display.clearDisplay();
+    if (currentParamSelect == 1) param_select = 1;
+    hideTimer = millis();
+  }
+
+  hide = (millis() - hideTimer >= (menuTimer * 1000UL));
+  bool showParams = !hide;
+
+  switch (mode) {
+    case MODE_LFO:      runLFOMode(showParams); break;
+    case MODE_WAVE:     runWaveMode(showParams); break;
+    case MODE_SHOT:     runShotMode(showParams); break;
+    case MODE_SPECTRUM: runSpectrumMode(showParams); break;
+  }
+
+  display.display();
+
+  // (Optional) web scope streaming 
+  // if (webscopeEnabled) { /* stream a decimated frame over Serial */ }
 }
 
-// Boot animation
+// ---------------- Boot animation ----------------
 void drawBootAnimation() {
   for (int x = 0; x <= logoWidth; x += 10) {
     display.clearDisplay();
-    
-    // Position the bitmap at the same vertical offset as in the original
     display.drawBitmap(0, yOffset, Modulove_Logo, logoWidth, logoHeight, WHITE);
-    
-    // Apply the wipe effect
     display.fillRect(x, yOffset, logoWidth - x, logoHeight, BLACK);
-    
     display.display();
   }
 }
 
-// Configure hardware for specific mode
-void setupMode(uint8_t mode) {
-  // First load any saved parameters for this mode
-  int baseAddr = EEPROM_PARAM_SELECT_ADDR + ((mode - 1) * 3);
-  
-  // Load the parameters for the selected mode
+// ---------------- Mode setup ----------------
+void setupMode(uint8_t m) {
+  int baseAddr = EEPROM_PARAM_SELECT_ADDR + ((m - 1) * 3);
   uint8_t saved_param_select = EEPROM.read(baseAddr);
   uint8_t saved_param1 = EEPROM.read(baseAddr + 1);
   uint8_t saved_param2 = EEPROM.read(baseAddr + 2);
-  
-  // Only use saved values if they're valid
-  if (saved_param_select <= 3) {
-    param_select = saved_param_select;
-  }
-  
-  // Now configure hardware based on mode
-  switch (mode) {
+  if (saved_param_select <= 3) param_select = saved_param_select;
+
+  switch (m) {
     case MODE_LFO:
-      // Use saved param1 and param2 if they're valid, otherwise use defaults
-      if (saved_param1 >= 1 && saved_param1 <= 8) {
-        param1 = saved_param1;
-      } else {
-        param1 = 4;  // Default Time
-      }
-      
-      if (saved_param2 >= 1 && saved_param2 <= 8) {
-        param2 = saved_param2;
-      } else {
-        param2 = 1;  // Default Offset
-      }
-      
-      pinMode(FILTER_PIN, INPUT);  // No active 2-pole filter
-      analogWrite(OFFSET_PIN, 0);  // Offset = 0V
-      
-      // Fast ADC setup
-      ADCSRA = (ADCSRA & 0xf8) | 0x04;  // Fast ADC *8 speed
+      param1 = (saved_param1 >= 1 && saved_param1 <= 8) ? saved_param1 : 4; // Time
+      param2 = (saved_param2 >= -6 && saved_param2 <= 10) ? saved_param2 : 1; // Offset
+      pinMode(FILTER_PIN, INPUT);
+      analogWrite(OFFSET_PIN, 0);
+      ADCSRA = (ADCSRA & 0xF8) | 0x04; // prescaler /16 (fast)
       break;
-      
+
     case MODE_WAVE:
-      // Use saved param1 and param2 if they're valid, otherwise use defaults
-      if (saved_param1 >= 1 && saved_param1 <= 8) {
-        param1 = saved_param1;
-      } else {
-        param1 = 8;  // Default Time
-      }
-      
-      if (saved_param2 >= 1 && saved_param2 <= 6) {
-        param2 = saved_param2;
-      } else {
-        param2 = 1;  // Default Refresh rate
-      }
-      
-      analogWrite(OFFSET_PIN, 127);  // Offset = 2.5V
-      pinMode(FILTER_PIN, INPUT);    // No active 2-pole filter
-      
-      // Fast ADC setup
-      ADCSRA = (ADCSRA & 0xf8) | 0x04;  // Fast ADC *8 speed
+      param1 = (saved_param1 >= 1 && saved_param1 <= 8) ? saved_param1 : 8; // Time
+      param2 = (saved_param2 >= 1 && saved_param2 <= 6) ? saved_param2 : 1; // Refresh
+      analogWrite(OFFSET_PIN, 127);
+      pinMode(FILTER_PIN, INPUT);
+      ADCSRA = (ADCSRA & 0xF8) | 0x04;
       break;
-      
+
     case MODE_SHOT:
-      // Use saved param1 if valid, otherwise use default
-      if (saved_param1 >= 1 && saved_param1 <= 4) {
-        param1 = saved_param1;
-      } else {
-        param1 = 2;  // Default Time
-      }
-      
-      param2 = 1;  // Not used in this mode
-      analogWrite(OFFSET_PIN, 127);  // Offset = 2.5V
-      pinMode(FILTER_PIN, INPUT);    // No active 2-pole filter
-      
-      // Fast ADC setup
-      ADCSRA = (ADCSRA & 0xf8) | 0x04;  // Fast ADC *8 speed
+      param1 = (saved_param1 >= 1 && saved_param1 <= 4) ? saved_param1 : 2; // Time
+      param2 = 1;
+      analogWrite(OFFSET_PIN, 127);
+      pinMode(FILTER_PIN, INPUT);
+      ADCSRA = (ADCSRA & 0xF8) | 0x04;
       break;
-      
+
     case MODE_SPECTRUM:
-      // Use saved param1 and param2 if they're valid, otherwise use defaults
-      if (saved_param1 >= 1 && saved_param1 <= 4) {
-        param1 = saved_param1;
-      } else {
-        param1 = 1;  // Default High freq amp
-      }
-      
-      if (saved_param2 >= 1 && saved_param2 <= 8) {
-        param2 = saved_param2;
-      } else {
-        param2 = 8;  // Default Noise filter
-      }
-      
-      analogWrite(OFFSET_PIN, 127);  // Offset = 2.5V
-      
-      // Active filter setup
+      param1 = (saved_param1 >= 1 && saved_param1 <= 4) ? saved_param1 : 1; // HF amp
+      param2 = (saved_param2 >= 1 && saved_param2 <= 8) ? saved_param2 : 8; // Noise filt
+      analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, OUTPUT);
       digitalWrite(FILTER_PIN, LOW);
-      
-      // Standard ADC for better accuracy
-      ADCSRA = (ADCSRA & 0xf8) | 0x07;
+      ADCSRA = (ADCSRA & 0xF8) | 0x07; // prescaler /128 (accuracy)
       break;
   }
-  
-  // Zero out the buffer
+
   memset(&buffer, 0, sizeof(buffer));
-  
-  // Reset refresh counter
   rfrs = 0;
 }
 
-
-// LFO Mode (Low Frequency Oscilloscope)
+// ---------------- LFO Mode ----------------
 void runLFOMode(bool showParams) {
-  // Constrain parameters to valid ranges
-  param = constrain(param, 1, 3);
+  param  = constrain(param, 1, 3);
   param1 = constrain(param1, 1, 8);  // Time scale
-  param2 = constrain(param2, 1, 8);  // Vertical offset
-  
-  // Sample current value
-  uint8_t currentSample = analogRead(ANALOG_INPUT_PIN) / 16;  // Scale to 0-63
-  
-  // Shift buffer for scrolling effect
-  for (int i = 127; i > 0; i--) {
-    buffer.waveform[i] = buffer.waveform[i - 1];
-  }
+  param2 = constrain(param2, -6, 10);  // Vertical offset
+
+  uint8_t currentSample = analogRead(ANALOG_INPUT_PIN) >> 4; // 0..63
+
+  // Scroll waveform 
+  memmove(&buffer.waveform[1], &buffer.waveform[0], 127);
   buffer.waveform[0] = currentSample;
-  
-  // Redraw display only when needed (parameters changed or new sample)
-  static unsigned long lastDrawTime = 0;
-  if (millis() - lastDrawTime >= 50) { // Limit refresh rate to avoid flickering
-    lastDrawTime = millis();
+
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw >= 50) {
+    lastDraw = millis();
     display.clearDisplay();
-    
-    // Draw waveform
-    for (int i = 0; i < 126 / (9 - param1); i++) {
-      int x1 = 127 - (i * (9 - param1));
-      int y1 = 63 - buffer.waveform[i] - (param2 - 1) * 4;
-      int x2 = 127 - ((i + 1) * (9 - param1));
-      int y2 = 63 - buffer.waveform[i + 1] - (param2 - 1) * 4;
-      
+
+    int step = (9 - param1);
+    int voff = (param2 - 1) * 6;
+    int segments = 126 / step;
+
+    for (int i = 0; i < segments; i++) {
+      int x1 = 127 - (i * step);
+      int y1 = 63 - buffer.waveform[i] - voff;
+      int x2 = 127 - ((i + 1) * step);
+      int y2 = 63 - buffer.waveform[i + 1] - voff;
+      if (y1 < 0) y1 = 0; if (y1 > 63) y1 = 63;
+      if (y2 < 0) y2 = 0; if (y2 > 63) y2 = 63;
       display.drawLine(x1, y1, x2, y2, WHITE);
     }
-    
-    // Show parameters if needed
-    if (showParams) {
-      drawParameterBar(showParams);
-    }
+
+    if (showParams) drawParameterBar(true);
   }
 }
 
-// Wave Mode (High Frequency Oscilloscope)
+// ---------------- Wave Mode ----------------
 void runWaveMode(bool showParams) {
-  // Constrain parameters to valid ranges
-  param = constrain(param, 1, 3);
-  param1 = constrain(param1, 1, 8);  // Time scale
-  param2 = constrain(param2, 1, 6);  // Refresh rate
-  
-  // Calculate the actual update frequency based on refresh rate
-  static unsigned long lastUpdateTime = 0;
-  unsigned long updateInterval = 50 + (param2 - 1) * 100; // 50ms base + additional delay by param
-  bool updateNeeded = (millis() - lastUpdateTime >= updateInterval);
-  
-  // Sample data based on time scale
-  if (param1 > 5) {  // Mid frequency
-    // Only sample and redraw when it's time to update
-    if (updateNeeded) {
-      lastUpdateTime = millis();
-      
-      // Sample data
-      for (int i = 127; i >= 0; i--) {
-        buffer.waveform[i] = analogRead(ANALOG_INPUT_PIN) / 16;
-        delayMicroseconds((param1 - 5) * 20);
-      }
-      
-      // Clear and redraw
-      display.clearDisplay();
-      
-      // Draw waveform
-      for (int i = 127; i >= 1; i--) {
-        display.drawLine(127 - i, 63 - buffer.waveform[i - 1], 
-                        127 - (i + 1), 63 - buffer.waveform[i], WHITE);
-      }
-      
-      // Show parameters if needed
-      if (showParams) {
-        drawParameterBar(showParams);
-      }
+  param  = constrain(param, 1, 3);
+  param1 = constrain(param1, 1, 8); // Time scale
+  param2 = constrain(param2, 1, 6); // Refresh
+
+  static unsigned long lastUpdate = 0;
+  unsigned long interval = 50UL + (param2 - 1) * 100UL;
+  if (millis() - lastUpdate < interval) return;
+  lastUpdate = millis();
+
+  display.clearDisplay();
+
+  if (param1 > 5) {
+    // Mid frequency: slower sampling with small delay
+    uint8_t d = (param1 - 5) * 20; // ~20..60 us
+    for (int i = 127; i >= 0; i--) {
+      buffer.waveform[i] = analogRead(ANALOG_INPUT_PIN) >> 4;
+      if (d) delayMicroseconds(d);
     }
-  } else if (param1 <= 5) {  // High frequency
-    // Only sample and redraw when it's time to update
-    if (updateNeeded) {
-      lastUpdateTime = millis();
-      
-      // Sample data
-      for (int i = 127 / (6 - param1); i >= 0; i--) {
-        buffer.waveform[i] = analogRead(ANALOG_INPUT_PIN) / 16;
-      }
-      
-      // Clear and redraw
-      display.clearDisplay();
-      
-      // Draw waveform with fewer points
-      for (int i = 127 / (6 - param1); i >= 1; i--) {
-        display.drawLine(127 - i * (6 - param1), 63 - buffer.waveform[i - 1], 
-                        127 - (i + 1) * (6 - param1), 63 - buffer.waveform[i], WHITE);
-      }
-      
-      // Show parameters if needed
-      if (showParams) {
-        drawParameterBar(showParams);
-      }
+    for (int i = 127; i >= 1; i--) {
+      display.drawLine(127 - i, 63 - buffer.waveform[i - 1],
+                       127 - (i + 1), 63 - buffer.waveform[i], WHITE);
+    }
+  } else {
+    // High frequency: fewer points
+    int stride = (6 - param1); // 5..1
+    int count = 127 / stride;
+    for (int i = count; i >= 0; i--) {
+      buffer.waveform[i] = analogRead(ANALOG_INPUT_PIN) >> 4;
+    }
+    for (int i = count; i >= 1; i--) {
+      display.drawLine(127 - i * stride,     63 - buffer.waveform[i - 1],
+                       127 - (i + 1) * stride, 63 - buffer.waveform[i], WHITE);
     }
   }
+
+  if (showParams) drawParameterBar(true);
 }
 
-// Shot Mode (Triggered Oscilloscope)
+// ---------------- Shot (triggered) Mode ----------------
 void runShotMode(bool showParams) {
-  // Constrain parameters to valid ranges
-  param = constrain(param, 1, 2);
-  param1 = constrain(param1, 1, 4);  // Time scale
-  
-  // Update trigger state
+  param  = constrain(param, 1, 2);
+  param1 = constrain(param1, 1, 4); // Time scale
+
   old_trig = trig;
   trig = digitalRead(TRIGGER_PIN);
-  
-  // Track when we need to update the display
+
   static bool redrawNeeded = true;
-  static unsigned long lastUpdateTime = 0;
-  
-  // Detect rising edge trigger
+  static unsigned long lastUpdate = 0;
+
   if (!old_trig && trig) {
-    // On trigger, capture the waveform
+    // Capture after trigger
+    // Scale capture speed by param1 (lower param1 = faster)
+    // ~25..200 us per sample gives nice time windows
+    uint16_t us = (uint16_t)(25UL * (1UL << (param1 - 1))); // 25,50,100,200
     for (int i = 10; i <= 127; i++) {
-      buffer.waveform[i] = analogRead(ANALOG_INPUT_PIN) / 16;
-      delayMicroseconds(100000 * param1);  // Sampling rate
+      buffer.waveform[i] = analogRead(ANALOG_INPUT_PIN) >> 4;
+      if (us) delayMicroseconds(us);
     }
-    
-    // Add trigger marker
-    for (int i = 0; i < 10; i++) {
-      buffer.waveform[i] = 32;
-    }
-    
-    redrawNeeded = true;  // Flag that we need to redraw
+    // trigger marker
+    for (int i = 0; i < 10; i++) buffer.waveform[i] = 32;
+    redrawNeeded = true;
   }
-  
-  // Only redraw occasionally to prevent flickering
-  if (redrawNeeded || millis() - lastUpdateTime >= 200) {
-    lastUpdateTime = millis();
+
+  if (redrawNeeded || millis() - lastUpdate >= 200) {
+    lastUpdate = millis();
     redrawNeeded = false;
-    
-    // Clear and draw
+
     display.clearDisplay();
-    
-    // Draw waveform
-    for (int i = 126; i >= 1; i--) {
-      display.drawLine(i, 63 - buffer.waveform[i], (i + 1), 63 - buffer.waveform[i + 1], WHITE);
+    for (int i = 1; i < 127; i++) {
+      display.drawLine(i, 63 - buffer.waveform[i], i + 1, 63 - buffer.waveform[i + 1], WHITE);
     }
-    
-    // Show parameters if needed
-    if (showParams) {
-      drawParameterBar(showParams);
-    }
+    if (showParams) drawParameterBar(true);
   }
 }
 
-// Spectrum Mode (Frequency Analyzer)
+// ---------------- Spectrum Mode ----------------
 void runSpectrumMode(bool showParams) {
-  // Constrain parameters to valid ranges
-  param = constrain(param, 1, 3);
-  param1 = constrain(param1, 1, 4);  // High freq sense
-  param2 = constrain(param2, 1, 8);  // Noise filter
-  
-  // Limit update rate to prevent flickering
-  static unsigned long lastUpdateTime = 0;
-  unsigned long updateInterval = 100; // Update every 100ms
-  
-  if (millis() - lastUpdateTime >= updateInterval) {
-    lastUpdateTime = millis();
-    
-    // Sample data for spectrum analysis
-    for (uint8_t i = 0; i < 128; i++) {
-      int spec = analogRead(ANALOG_INPUT_PIN);
-      buffer.spectrum.real[i] = spec / 4 - 128;  // Convert to signed 8-bit
-      buffer.spectrum.imag[i] = 0;
-    }
-    
-    // Perform FFT
-    fix_fft(buffer.spectrum.real, buffer.spectrum.imag, 7, 0);
-    
-    // Clear display and redraw
-    display.clearDisplay();
-    
-    // Draw spectrum
-    for (uint8_t i = 0; i < 64; i++) {
-      // Calculate magnitude
-      int level = sqrt(buffer.spectrum.real[i] * buffer.spectrum.real[i] + 
-                      buffer.spectrum.imag[i] * buffer.spectrum.imag[i]);
-      
-      // Apply noise filter
-      if (level >= param2) {
-        // Draw bar with high frequency amplification
-        display.fillRect(i * 2, 63 - (level + i * (param1 - 1) / 8), 2, 
-                        (level + i * (param1 - 1) / 8), WHITE);
-      }
-    }
-    
-    // Show parameters if needed
-    if (showParams) {
-      drawParameterBar(showParams);
+  param  = constrain(param, 1, 3);
+  param1 = constrain(param1, 1, 4); // HF “tilt”
+  param2 = constrain(param2, 1, 8); // Noise threshold
+
+  static unsigned long lastUpdate = 0;
+  const unsigned long interval = 100;
+  if (millis() - lastUpdate < interval) return;
+  lastUpdate = millis();
+
+  for (uint8_t i = 0; i < 128; i++) {
+    int spec = analogRead(ANALOG_INPUT_PIN);
+    buffer.spectrum.real[i] = (spec >> 2) - 128; // center
+    buffer.spectrum.imag[i] = 0;
+  }
+
+  fix_fft(buffer.spectrum.real, buffer.spectrum.imag, 7, 0);
+
+  display.clearDisplay();
+
+  // Fast magnitude approximation: |re| + |im| (no sqrt)
+  for (uint8_t i = 0; i < 64; i++) {
+    int re = buffer.spectrum.real[i];
+    int im = buffer.spectrum.imag[i];
+    int level = abs(re) + abs(im); // 0..~512
+
+    if (level >= (param2 * 2)) {
+      // high-frequency “tilt”
+      int boosted = level + ((int)i * (param1 - 1));
+      if (boosted > 63) boosted = 63;
+      if (boosted < 0)  boosted = 0;
+      display.fillRect(i * 2, 63 - boosted, 2, boosted, WHITE);
     }
   }
+
+  if (showParams) drawParameterBar(true);
 }
 
-// Draw parameter bar at top of screen
+// ---------------- Parameter bar ----------------
 void drawParameterBar(bool showParams) {
   if (!showParams) return;
-  
-  // Highlight current parameter
+
   display.drawLine((param - 1) * 42, 8, (param - 1) * 42 + 36, 8, WHITE);
-  
-  // Draw mode parameter
-  display.setTextColor(param_select == 1 ? BLACK : WHITE, 
-                       param_select == 1 ? WHITE : BLACK);
-  display.setCursor(0, 0);
-  display.print("Mode:");
-  display.setCursor(30, 0);
-  display.print(mode);
-  
-  // Draw param1 (changes by mode)
-  display.setTextColor(param_select == 2 ? BLACK : WHITE, 
-                       param_select == 2 ? WHITE : BLACK);
+
+  display.setTextColor((param_select == 1) ? BLACK : WHITE, (param_select == 1) ? WHITE : BLACK);
+  display.setCursor(0, 0); display.print(F("Mode:"));
+  display.setCursor(30, 0); display.print(mode);
+
+  display.setTextColor((param_select == 2) ? BLACK : WHITE, (param_select == 2) ? WHITE : BLACK);
   display.setCursor(42, 0);
-  
   switch (mode) {
     case MODE_LFO:
     case MODE_WAVE:
-    case MODE_SHOT:
-      display.print("Time:");
-      break;
-    case MODE_SPECTRUM:
-      display.print("High:");
-      break;
+    case MODE_SHOT:    display.print(F("Time:")); break;
+    case MODE_SPECTRUM:display.print(F("High:")); break;
   }
-  
-  display.setCursor(72, 0);
-  display.print(param1);
-  
-  // Draw param2 or trigger indicator
+  display.setCursor(72, 0); display.print(param1);
+
   if (mode == MODE_SHOT) {
-    // Show trigger indicator for Shot mode
-    display.setTextColor(trig ? BLACK : WHITE, 
-                         trig ? WHITE : BLACK);
-    display.setCursor(84, 0);
-    display.print("TRIG");
+    display.setTextColor(trig ? BLACK : WHITE, trig ? WHITE : BLACK);
+    display.setCursor(84, 0); display.print(F("TRIG"));
   } else {
-    // Show param2 for other modes
-    display.setTextColor(param_select == 3 ? BLACK : WHITE, 
-                         param_select == 3 ? WHITE : BLACK);
+    display.setTextColor((param_select == 3) ? BLACK : WHITE, (param_select == 3) ? WHITE : BLACK);
     display.setCursor(84, 0);
-    
     switch (mode) {
-      case MODE_LFO:
-        display.print("Offs:");
-        break;
-      case MODE_WAVE:
-        display.print("Rfrs:");
-        break;
-      case MODE_SPECTRUM:
-        display.print("Filt:");
-        break;
+      case MODE_LFO:     display.print(F("Offs:")); break;
+      case MODE_WAVE:    display.print(F("Rfrs:")); break;
+      case MODE_SPECTRUM:display.print(F("Filt:")); break;
     }
-    
-    display.setCursor(114, 0);
-    display.print(param2);
+    display.setCursor(114, 0); display.print(param2);
   }
 }
 
-// Handle secret menu for settings
+// ---------------- config menu (new: OLED rotation) ----------------
 void secretMenu() {
   int newDirection = encoderDirection;
   newPosition = encoder.read();
 
-  // Check if the encoder was turned
   if (newPosition > (oldPosition + 3)) {
     oldPosition = newPosition;
     if (secretMenuOption == 1) {
-      newDirection = 1;  // Normal direction
+      newDirection = 1;
     } else if (secretMenuOption == 2) {
-      menuTimer -= 1;  // Always increment when turning right
-      menuTimer = constrain(menuTimer, 1, 60);
+      if (menuTimer > 1) menuTimer--;
+    } else if (secretMenuOption == 3) {
+      oledRotation = 0;                      // 0°
+      display.setRotation(oledRotation);     // Apply immediately
+      display.clearDisplay();
     }
   } else if (newPosition < (oldPosition - 3)) {
     oldPosition = newPosition;
     if (secretMenuOption == 1) {
-      newDirection = -1;  // Reversed direction
+      newDirection = -1;
     } else if (secretMenuOption == 2) {
-      menuTimer += 1;  // Always decrement when turning left
-      menuTimer = constrain(menuTimer, 1, 60);
+      if (menuTimer < 60) menuTimer++;
+    } else if (secretMenuOption == 3) {
+      oledRotation = 2;                      // 180°
+      display.setRotation(oledRotation);
+      display.clearDisplay();
     }
   }
 
-  // Update encoder direction if changed
-  if (newDirection != encoderDirection) {
-    encoderDirection = newDirection;
-  }
+  if (newDirection != encoderDirection) encoderDirection = newDirection;
 
-  // Rest of the function remains unchanged
-  // Handle button press
+  // Cycle menu item on short press
   if (old_SW == 0 && SW == 1) {
-    secretMenuOption = secretMenuOption == 1 ? 2 : 1;
+    secretMenuOption = (secretMenuOption % 3) + 1; // 1→2→3→1
   }
 
-  // Check for long press to exit
-  if (SW && !encoderPressed) {
-    encoderPressed = true;
-    exitPressStartTime = millis();
-  } else if (!SW && encoderPressed) {
-    encoderPressed = false;
-    exitPressStartTime = 0;
-  }
+  // Long hold to save/exit
+  if (SW && !encoderPressed) { encoderPressed = true; exitPressStartTime = millis(); }
+  else if (!SW && encoderPressed) { encoderPressed = false; exitPressStartTime = 0; }
 
-  // Calculate exit progress (0-100%)
   int exitProgress = 0;
   if (encoderPressed && exitPressStartTime > 0) {
-    unsigned long pressDuration = millis() - exitPressStartTime;
-    exitProgress = (pressDuration * 100) / 3000;  // 3000ms = 100%
-    exitProgress = constrain(exitProgress, 0, 100);
+    unsigned long d = millis() - exitPressStartTime;
+    exitProgress = (int)constrain((long)(d * 100 / 3000), 0L, 100L);
   }
 
-  // Exit after long press
   if (exitProgress >= 100) {
-    // Save settings to EEPROM
     EEPROM.put(ENCODER_DIR_ADDR, encoderDirection);
-    delay(10);
-    EEPROM.put(MENUTIMER_DIR_ADDR, menuTimer);
-    delay(10);
-    
-    // Show save confirmation
+    delay(5);
+    EEPROM.write(OLED_ROT_ADDR, oledRotation);
+    delay(5);
+    EEPROM.put(MENUTIMER_DIR_ADDR, (uint8_t)menuTimer);
+    delay(5);
+
     display.clearDisplay();
     display.setTextColor(WHITE);
-    display.setCursor(20, 25);
-    display.print("SETTINGS SAVED");
+    display.setCursor(16, 25);
+    display.print(F("SETTINGS SAVED"));
     display.display();
-    delay(1000);
-    
-    // Exit menu
+    delay(700);
+
     secretMenuActive = false;
     encoderPressed = false;
     exitPressStartTime = 0;
-    oldPosition = newPosition = encoder.read() * encoderDirection;  // Reset positions
+    oldPosition = newPosition = encoder.read() * encoderDirection;
     display.clearDisplay();
     display.display();
     return;
   }
 
-  // Draw secret menu
+  // Draw menu
   display.clearDisplay();
   display.setCursor(0, 0);
   display.setTextColor(WHITE);
-  display.println("GLOBAL SETTINGS MENU");
-  
-  // Encoder direction option
-  display.setTextColor(secretMenuOption == 1 ? BLACK : WHITE, 
-                      secretMenuOption == 1 ? WHITE : BLACK);
-  display.println("Encoder Direction:");
+  display.println(F("GLOBAL SETTINGS"));
+  display.println();
+
+  // 1) Encoder direction
+  display.setTextColor(secretMenuOption == 1 ? BLACK : WHITE, secretMenuOption == 1 ? WHITE : BLACK);
+  display.print(F("Encoder: "));
   display.setTextColor(WHITE);
-  display.println(encoderDirection == 1 ? "Normal" : "Reversed");
-  display.println("");
-  
-  // Menu timer option
-  display.setTextColor(secretMenuOption == 2 ? BLACK : WHITE, 
-                      secretMenuOption == 2 ? WHITE : BLACK);
-  display.println("Menu Timer:");
+  display.print(encoderDirection == 1 ? (" Normal") : (" Reversed"));
+  display.println();
+
+  // 2) Menu timer
+  display.setTextColor(secretMenuOption == 2 ? BLACK : WHITE, secretMenuOption == 2 ? WHITE : BLACK);
+  display.print(F("Timer: "));
   display.setTextColor(WHITE);
-  display.print(menuTimer);
-  display.println(" seconds");
-  
-  // Draw exit progress bar if button is pressed
+  display.print(menuTimer); display.print((" s"));
+  display.println();
+
+  // 3) OLED Rotation
+  display.setTextColor(secretMenuOption == 3 ? BLACK : WHITE, secretMenuOption == 3 ? WHITE : BLACK);
+  display.print(F("OLED: "));
+  display.setTextColor(WHITE);
+  display.print(oledRotation == 0 ? (" 0 deg") : (" 180 deg"));
+
+  // Exit bar
   if (exitProgress > 0) {
-    display.drawRect(0, 56, 128, 8, WHITE);
-    display.fillRect(2, 58, (exitProgress * 124) / 100, 4, WHITE);
-    display.setCursor(0, 48);
-    display.print("Hold to save & exit");
+    display.drawRect(0, 54, 128, 8, WHITE);
+    display.fillRect(2, 56, (exitProgress * 124) / 100, 4, WHITE);
+    display.setCursor(4, 44); display.print(F("Hold to save & exit"));
   } else {
-    display.setCursor(0, 56);
-    display.print("Hold button to exit");
+    display.setCursor(4, 52); display.print(F("Hold button to exit"));
   }
-  
   display.display();
 }
 
+// ---------------- Save/Load mode params ----------------
 void saveSettings() {
-  // Save current mode
   EEPROM.write(EEPROM_MODE_ADDR, mode);
-  delay(10); // Small delay to ensure write completes
-  
-  // Use specific mode offset for storing parameters
-  // Starting at EEPROM_PARAM_SELECT_ADDR (which is 5)
-  // Each mode gets 3 bytes: param_select, param1, param2
   int baseAddr = EEPROM_PARAM_SELECT_ADDR + ((mode - 1) * 3);
-  
-  // Write the parameters
-  EEPROM.write(baseAddr, param_select);
-  delay(5);
-  EEPROM.write(baseAddr + 1, param1);
-  delay(5);
-  EEPROM.write(baseAddr + 2, param2);
-  delay(5);
-  
+  EEPROM.write(baseAddr,     param_select); delay(3);
+  EEPROM.write(baseAddr + 1, param1);       delay(3);
+  EEPROM.write(baseAddr + 2, param2);       delay(3);
+
   lastSaveTime = millis();
-  
-  // Visual feedback for saving
-  display.fillRect(0, 54, 128, 10, WHITE); // White bar at top
+  display.fillRect(0, 54, 128, 10, WHITE);
   display.setTextColor(BLACK);
   display.setCursor(8, 55);
-  display.print("MODE SETTINGS SAVED");
+  display.print(F("MODE SETTINGS SAVED"));
   display.display();
-  delay(1000);
-  
-  // Optional: Show what was saved (helpful for debugging)
-  /*
-  display.clearDisplay();
-  display.setTextColor(WHITE);
-  display.setCursor(0, 0);
-  display.print("Mode: ");
-  display.println(mode);
-  display.print("Param1: ");
-  display.println(param1);
-  display.print("Param2: ");
-  display.println(param2);
-  display.print("ParamSel: ");
-  display.println(param_select);
-  display.display();
-  delay(1000);
-  */
+  delay(600);
 }
 
-// Load settings from EEPROM
 void loadSettings() {
-  // Calculate the mode-specific address
   int baseAddr = EEPROM_PARAM_SELECT_ADDR + ((mode - 1) * 3);
-  
-  // Load the parameters for the current mode
   param_select = EEPROM.read(baseAddr);
   param1 = EEPROM.read(baseAddr + 1);
   param2 = EEPROM.read(baseAddr + 2);
-  
-  // Validate parameters (in case of EEPROM corruption)
+
   if (param_select > 3) param_select = 0;
-  
-  // Mode-specific parameter validation
+
   switch (mode) {
     case MODE_LFO:
       param1 = constrain(param1, 1, 8);
       param2 = constrain(param2, 1, 8);
       break;
-      
     case MODE_WAVE:
       param1 = constrain(param1, 1, 8);
       param2 = constrain(param2, 1, 6);
       break;
-      
     case MODE_SHOT:
       param1 = constrain(param1, 1, 4);
-      param2 = constrain(param2, 1, 1);
+      param2 = 1;
       break;
-      
     case MODE_SPECTRUM:
       param1 = constrain(param1, 1, 4);
       param2 = constrain(param2, 1, 8);
