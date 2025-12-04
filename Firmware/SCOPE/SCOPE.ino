@@ -44,6 +44,7 @@ Encoder encoder(ENCODER_PIN_A, ENCODER_PIN_B);
 #define ENCODER_DIR_ADDR      0
 #define OLED_ROT_ADDR         1
 #define MENUTIMER_DIR_ADDR    2
+#define BOOTLOGO_ADDR         3
 const int EEPROM_MODE_ADDR = 4;
 const int EEPROM_PARAM_SELECT_ADDR = 5;
 
@@ -52,6 +53,7 @@ const int EEPROM_PARAM_SELECT_ADDR = 5;
 #define MODE_WAVE     2
 #define MODE_SHOT     3
 #define MODE_SPECTRUM 4
+#define MODE_TUNER    5
 
 // ---------------- Boot logo (PROGMEM) ----------------
 const unsigned char Modulove_Logo [] PROGMEM = {
@@ -115,10 +117,11 @@ bool encoderPressed = false;
 bool secretMenuActive = false;
 unsigned long enterPressStartTime = 0;
 unsigned long exitPressStartTime  = 0;
-byte secretMenuOption = 1; // 1=encoder dir, 2=menu timer, 3=OLED rotation
+byte secretMenuOption = 1; // 1=encoder dir, 2=menu timer, 3=OLED rotation, 4=boot logo
 unsigned int menuTimer = 5; // seconds
 int encoderDirection = 1;   // 1 or -1
 uint8_t oledRotation = 0;   // 0 or 2 for SSD1306
+bool bootLogoEnabled = true; // Show boot logo
 
 // Data buffer union
 union {
@@ -135,10 +138,13 @@ void runLFOMode(bool showParams);
 void runWaveMode(bool showParams);
 void runShotMode(bool showParams);
 void runSpectrumMode(bool showParams);
+void runTunerMode(bool showParams);
 void drawParameterBar(bool showParams);
 void secretMenu();
 void saveSettings();
 void loadSettings();
+float detectFrequency();
+void frequencyToNote(float freq, char* noteName, int* octave, float* cents);
 
 // ---------------- Setup ----------------
 void setup() {
@@ -154,9 +160,13 @@ void setup() {
   EEPROM.get(MENUTIMER_DIR_ADDR, menuTimer);
   if (menuTimer < 1 || menuTimer > 60) menuTimer = 5;
 
+  // Load boot logo setting
+  bootLogoEnabled = EEPROM.read(BOOTLOGO_ADDR);
+  if (bootLogoEnabled != 0 && bootLogoEnabled != 1) bootLogoEnabled = true;
+
   // Load last mode
   uint8_t lastMode = EEPROM.read(EEPROM_MODE_ADDR);
-  if (lastMode >= MODE_LFO && lastMode <= MODE_SPECTRUM) mode = lastMode;
+  if (lastMode >= MODE_LFO && lastMode <= MODE_TUNER) mode = lastMode;
 
   // Display init
   display.begin(SSD1306_SWITCHCAPVCC);
@@ -165,8 +175,10 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(WHITE);
 
-  drawBootAnimation();
-  delay(800);
+  if (bootLogoEnabled) {
+    drawBootAnimation();
+    delay(800);
+  }
 
   // I/O
   pinMode(OFFSET_PIN, OUTPUT);
@@ -228,11 +240,11 @@ void loop() {
   // ---------- Normal operation ----------
   newPosition = encoderDirection * encoder.read();
 
-  // Button: cycle through parameter “slots” 
+  // Button: cycle through parameter "slots"
   if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
   else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
 
-  mode = constrain(mode, 1, 4);
+  mode = constrain(mode, 1, 5);
   param = constrain(param, 1, 3);
 
   newPosition = encoderDirection * encoder.read();
@@ -271,6 +283,7 @@ void loop() {
     case MODE_WAVE:     runWaveMode(showParams); break;
     case MODE_SHOT:     runShotMode(showParams); break;
     case MODE_SPECTRUM: runSpectrumMode(showParams); break;
+    case MODE_TUNER:    runTunerMode(showParams); break;
   }
 
   display.display();
@@ -329,6 +342,14 @@ void setupMode(uint8_t m) {
       pinMode(FILTER_PIN, OUTPUT);
       digitalWrite(FILTER_PIN, LOW);
       ADCSRA = (ADCSRA & 0xF8) | 0x07; // prescaler /128 (accuracy)
+      break;
+
+    case MODE_TUNER:
+      param1 = (saved_param1 >= 1 && saved_param1 <= 8) ? saved_param1 : 4; // Averaging
+      param2 = 1;
+      analogWrite(OFFSET_PIN, 127);
+      pinMode(FILTER_PIN, INPUT);
+      ADCSRA = (ADCSRA & 0xF8) | 0x04; // prescaler /16 (fast)
       break;
   }
 
@@ -504,12 +525,15 @@ void drawParameterBar(bool showParams) {
     case MODE_WAVE:
     case MODE_SHOT:    display.print(F("Time:")); break;
     case MODE_SPECTRUM:display.print(F("High:")); break;
+    case MODE_TUNER:   display.print(F("Avg: ")); break;
   }
   display.setCursor(72, 0); display.print(param1);
 
   if (mode == MODE_SHOT) {
     display.setTextColor(trig ? BLACK : WHITE, trig ? WHITE : BLACK);
     display.setCursor(84, 0); display.print(F("TRIG"));
+  } else if (mode == MODE_TUNER) {
+    // Tuner mode has no param2
   } else {
     display.setTextColor((param_select == 3) ? BLACK : WHITE, (param_select == 3) ? WHITE : BLACK);
     display.setCursor(84, 0);
@@ -537,6 +561,8 @@ void secretMenu() {
       oledRotation = 0;                      // 0°
       display.setRotation(oledRotation);     // Apply immediately
       display.clearDisplay();
+    } else if (secretMenuOption == 4) {
+      bootLogoEnabled = false;
     }
   } else if (newPosition < (oldPosition - 3)) {
     oldPosition = newPosition;
@@ -548,6 +574,8 @@ void secretMenu() {
       oledRotation = 2;                      // 180°
       display.setRotation(oledRotation);
       display.clearDisplay();
+    } else if (secretMenuOption == 4) {
+      bootLogoEnabled = true;
     }
   }
 
@@ -555,7 +583,7 @@ void secretMenu() {
 
   // Cycle menu item on short press
   if (old_SW == 0 && SW == 1) {
-    secretMenuOption = (secretMenuOption % 3) + 1; // 1→2→3→1
+    secretMenuOption = (secretMenuOption % 4) + 1; // 1→2→3→4→1
   }
 
   // Long hold to save/exit
@@ -574,6 +602,8 @@ void secretMenu() {
     EEPROM.write(OLED_ROT_ADDR, oledRotation);
     delay(5);
     EEPROM.put(MENUTIMER_DIR_ADDR, (uint8_t)menuTimer);
+    delay(5);
+    EEPROM.write(BOOTLOGO_ADDR, bootLogoEnabled ? 1 : 0);
     delay(5);
 
     display.clearDisplay();
@@ -618,6 +648,13 @@ void secretMenu() {
   display.print(F("OLED: "));
   display.setTextColor(WHITE);
   display.print(oledRotation == 0 ? (" 0 deg") : (" 180 deg"));
+  display.println();
+
+  // 4) Boot Logo
+  display.setTextColor(secretMenuOption == 4 ? BLACK : WHITE, secretMenuOption == 4 ? WHITE : BLACK);
+  display.print(F("Logo: "));
+  display.setTextColor(WHITE);
+  display.print(bootLogoEnabled ? (" On") : (" Off"));
 
   // Exit bar
   if (exitProgress > 0) {
@@ -628,6 +665,178 @@ void secretMenu() {
     display.setCursor(4, 52); display.print(F("Hold button to exit"));
   }
   display.display();
+}
+
+// ---------------- Tuner Mode ----------------
+void runTunerMode(bool showParams) {
+  param  = constrain(param, 1, 2);
+  param1 = constrain(param1, 1, 8); // Averaging
+
+  // Take measurements less frequently to reduce interference from encoder/display
+  static unsigned long lastMeasurement = 0;
+  static unsigned long lastDisplay = 0;
+  static float readings[5] = {0, 0, 0, 0, 0};
+  static int readingIndex = 0;
+  static float displayFreq = 0;
+
+  // Measure every 100ms (reduced from 50ms to minimize encoder interrupt interference)
+  if (millis() - lastMeasurement >= 100) {
+    lastMeasurement = millis();
+
+    float rawFreq = detectFrequency();
+    if (rawFreq > 0) {
+      readings[readingIndex] = rawFreq;
+      readingIndex = (readingIndex + 1) % 5;
+    }
+  }
+
+  // Update display every 200ms
+  if (millis() - lastDisplay < 200) return;
+  lastDisplay = millis();
+
+  // Use median of last 5 readings (robust to outlier spikes)
+  float sortedReadings[5];
+  memcpy(sortedReadings, readings, sizeof(readings));
+
+  // Simple bubble sort for 5 elements
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < 4 - i; j++) {
+      if (sortedReadings[j] > sortedReadings[j + 1]) {
+        float t = sortedReadings[j];
+        sortedReadings[j] = sortedReadings[j + 1];
+        sortedReadings[j + 1] = t;
+      }
+    }
+  }
+
+  float medianFreq = sortedReadings[2]; // Middle value of 5
+
+  // Apply smoothing based on param1
+  static float smoothedFreq = 0;
+  if (medianFreq > 0) {
+    if (smoothedFreq == 0) {
+      smoothedFreq = medianFreq; // Initialize
+    } else if (param1 == 1) {
+      smoothedFreq = medianFreq; // No smoothing, just use median
+    } else {
+      // Exponential smoothing with median input
+      float alpha = 1.0 / param1;
+      smoothedFreq = alpha * medianFreq + (1.0 - alpha) * smoothedFreq;
+    }
+  }
+
+  displayFreq = smoothedFreq;
+  float frequency = displayFreq;
+
+  display.clearDisplay();
+
+  // Display frequency
+  display.setTextSize(2);
+  display.setCursor(0, 16);
+  if (frequency > 0.1 && frequency < 20000) {
+    if (frequency < 100) {
+      display.print(frequency, 2);
+    } else if (frequency < 1000) {
+      display.print(frequency, 1);
+    } else {
+      display.print((int)frequency);
+    }
+    display.print(F(" Hz"));
+  } else {
+    display.print(F("---"));
+  }
+
+  // Display note
+  if (frequency > 20 && frequency < 5000) {
+    char noteName[4];
+    int octave;
+    float cents;
+    frequencyToNote(frequency, noteName, &octave, &cents);
+
+    display.setTextSize(3);
+    display.setCursor(0, 36);
+    display.print(noteName);
+    display.print(octave);
+
+    // Show cents offset (small text)
+    display.setTextSize(1);
+    display.setCursor(80, 48);
+    if (cents > 0) display.print(F("+"));
+    display.print((int)cents);
+    display.print(F("c"));
+  }
+
+  if (showParams) drawParameterBar(true);
+}
+
+// Frequency detection using zero-crossing
+float detectFrequency() {
+  // First pass: find the signal's DC offset (average value)
+  long sum = 0;
+  int minVal = 63, maxVal = 0;
+  for (int i = 0; i < 64; i++) {
+    int sample = analogRead(ANALOG_INPUT_PIN) >> 4;
+    sum += sample;
+    if (sample < minVal) minVal = sample;
+    if (sample > maxVal) maxVal = sample;
+  }
+  int avgValue = sum / 64;
+  int threshold = avgValue; // Use actual DC offset as threshold
+
+  // Check if signal has enough amplitude
+  if ((maxVal - minVal) < 8) return 0; // Signal too weak
+
+  // Second pass: detect zero crossings
+  // DISABLE INTERRUPTS during timing-critical section to prevent jitter
+  unsigned long crossingTimes[10];
+  int crossingCount = 0;
+  bool lastState = false;
+
+  noInterrupts(); // Disable encoder and other interrupts
+
+  for (int i = 0; i < 1024 && crossingCount < 10; i++) {
+    int sample = analogRead(ANALOG_INPUT_PIN) >> 4;
+    bool currentState = (sample > threshold);
+
+    if (currentState && !lastState) { // Rising edge
+      crossingTimes[crossingCount++] = micros();
+    }
+    lastState = currentState;
+    delayMicroseconds(20);
+  }
+
+  interrupts(); // Re-enable interrupts
+
+  // Calculate average period
+  if (crossingCount < 3) return 0; // Not enough crossings
+
+  unsigned long totalPeriod = 0;
+  for (int i = 1; i < crossingCount; i++) {
+    totalPeriod += crossingTimes[i] - crossingTimes[i - 1];
+  }
+
+  float avgPeriod = (float)totalPeriod / (crossingCount - 1);
+  if (avgPeriod < 50) return 0; // Period too short (>20kHz)
+
+  return 1000000.0 / avgPeriod; // Convert to Hz
+}
+
+// Convert frequency to musical note
+void frequencyToNote(float freq, char* noteName, int* octave, float* cents) {
+  const char* noteNames[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+  // Calculate MIDI note number (A4 = 440Hz = MIDI 69)
+  float noteNum = 12.0 * log(freq / 440.0) / log(2.0) + 69.0;
+  int midiNote = round(noteNum);
+
+  // Calculate cents deviation
+  *cents = (noteNum - midiNote) * 100.0;
+
+  // Get note name and octave
+  int noteIndex = midiNote % 12;
+  *octave = (midiNote / 12) - 1;
+
+  strcpy(noteName, noteNames[noteIndex]);
 }
 
 // ---------------- Save/Load mode params ----------------
@@ -671,6 +880,10 @@ void loadSettings() {
     case MODE_SPECTRUM:
       param1 = constrain(param1, 1, 4);
       param2 = constrain(param2, 1, 8);
+      break;
+    case MODE_TUNER:
+      param1 = constrain(param1, 1, 8);
+      param2 = 1;
       break;
   }
 }

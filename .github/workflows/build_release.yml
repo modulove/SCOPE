@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        firmware: ["SCOPE"]
+        firmware: ["SCOPE", "SCOPEv2"]
         board: ["arduino:avr:nano", "arduino:avr:nano:cpu=atmega328old"]
         include:
           - board: arduino:avr:nano
