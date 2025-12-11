@@ -1,14 +1,13 @@
 /**
- * @file SCOPEv2.ino
+ * @file SCOPE.ino
  * @author Modulove
  * @brief Eurorack scope + OLED flip + Tuner
- * @version 1.8
- * @date 2025-12-02
+ * @version 2.3
+ * @date 2025-12-11
  * 
- * MODIFICATIONS v1.8:
- * - Tuner mode added
- * - Config menu: Added Boot Logo On/Off option
- * - ADC interrupt sampling
+ * NEW:
+ * - More reliable detection in tuner mode
+ * - Still WIP
  */
 
 #include <EEPROM.h>
@@ -58,25 +57,31 @@ const int EEPROM_PARAM_SELECT_ADDR = 5;
 #define MODE_TUNER    5
 #define NUM_MODES     5
 
-// ---------------- ADC Sampling  ----------------
+// ---------------- ADC Sampling System ----------------
 #define ADC_BUFFER_SIZE   256
-#define ADC_HALF_BUFFER   128
 
 volatile uint16_t adcSampleIndex = 0;
-volatile uint16_t adcTargetSamples = 128;  // How many samples to collect
+volatile uint16_t adcTargetSamples = 128;
 volatile bool adcBufferReady = false;
 volatile bool adcSampling = false;
-volatile uint8_t adcDelayCounter = 0;      // For slower sample rates
-volatile uint8_t adcDelayTarget = 0;       // Skip N interrupts between samples
+volatile uint8_t adcDelayCounter = 0;
+volatile uint8_t adcDelayTarget = 0;
 
 // ---------------- YIN Algorithm Constants ----------------
-#define YIN_THRESHOLD_FP  38    // 0.15 * 256 (fixed-point threshold)
+#define YIN_THRESHOLD_FP  38
 #define YIN_MIN_PERIOD    6
-#define YIN_MAX_PERIOD    120
+#define YIN_MAX_PERIOD    100
 
 // Tuner state
 float smoothedFrequency = 0;
-uint8_t tunerAutoRange = 2;  // Auto-detected range: 1=LOW, 2=MID, 3=HI
+uint8_t tunerMode = 1;          // 1=ZC, 2=YIN, 3=AUTO
+uint8_t tunerDetectionMethod = 0;
+uint8_t tunerSampleRate = 2;    // 1=slow(4.8kHz), 2=med(9.6kHz), 3=fast(19kHz)
+
+// Debug values
+uint8_t dbgCrossings = 0;
+uint8_t dbgMin = 255, dbgMax = 0;
+float dbgSampleRate = 0;
 
 // ---------------- Boot logo (PROGMEM) ----------------
 const unsigned char Modulove_Logo [] PROGMEM = {
@@ -116,14 +121,13 @@ const int logoWidth = 128;
 const int logoHeight = 30;
 const int yOffset = 14;
 
-// ---------------- Shared buffer (256 bytes) ----------------
+// ---------------- Shared buffer ----------------
 union {
   struct { int8_t real[128]; int8_t imag[128]; } spectrum;
-  uint8_t raw[256];  // For waveform (first 128) and YIN (all 256)
+  uint8_t raw[256];
 } buffer;
 
 // ---------------- Mode Settings Storage ----------------
-// Store settings for ALL modes (15 bytes total)
 struct ModeSettings {
   uint8_t param_select;
   uint8_t param1;
@@ -131,7 +135,6 @@ struct ModeSettings {
 };
 ModeSettings modeSettings[NUM_MODES];
 
-// Current working values 
 uint8_t mode = MODE_LFO;
 uint8_t old_mode = MODE_LFO;
 uint8_t param_select = 0;
@@ -150,7 +153,6 @@ int rfrs = 0;
 float oldPosition = -999;
 float newPosition = -999;
 
-// config menu
 bool configMenuActive = false;
 byte configMenuOption = 1;
 unsigned int menuTimer = 5;
@@ -174,12 +176,12 @@ void loadAllSettings();
 void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip);
 void stopADCSampling();
 float detectFrequencyYIN();
+float detectFrequencyZC(float sampleRate);
 
-// ================== Unified ADC Interrupt ==================
+// ================== ADC Interrupt ==================
 ISR(ADC_vect) {
   if (!adcSampling) return;
   
-  // Optional delay: skip N interrupts between samples
   if (adcDelayCounter < adcDelayTarget) {
     adcDelayCounter++;
     return;
@@ -197,9 +199,6 @@ ISR(ADC_vect) {
   }
 }
 
-// Start ADC sampling with configurable parameters
-// prescaler: ADC clock divider (0x05=/32, 0x06=/64, 0x07=/128)
-// delaySkip: skip N interrupts between samples (for slower rates)
 void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip) {
   cli();
   
@@ -210,12 +209,9 @@ void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip)
   adcDelayCounter = 0;
   adcDelayTarget = delaySkip;
   
-  // 8-bit left-adjusted, AVCC reference
   ADMUX = (1 << REFS0) | (1 << ADLAR) | (ANALOG_INPUT_PIN & 0x07);
-  
-  // Enable ADC, start conversion, auto-trigger, interrupt enable
   ADCSRA = (1 << ADEN) | (1 << ADSC) | (1 << ADATE) | (1 << ADIE) | (prescaler & 0x07);
-  ADCSRB = 0;  // Free-running mode
+  ADCSRB = 0;
   
   sei();
 }
@@ -223,6 +219,122 @@ void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip)
 void stopADCSampling() {
   ADCSRA &= ~((1 << ADIE) | (1 << ADATE));
   adcSampling = false;
+}
+
+// ================== Buffer-Based Zero-Crossing Detection ==================
+// Analyzes the buffer AFTER it's been filled by the ADC interrupt
+// Much more reliable than real-time detection
+
+float detectFrequencyZC(float sampleRate) {
+  // Find min/max in buffer for dynamic thresholding
+  uint8_t minVal = 255, maxVal = 0;
+  for (uint16_t i = 0; i < 256; i++) {
+    if (buffer.raw[i] < minVal) minVal = buffer.raw[i];
+    if (buffer.raw[i] > maxVal) maxVal = buffer.raw[i];
+  }
+  
+  dbgMin = minVal;
+  dbgMax = maxVal;
+  
+  // Need sufficient signal amplitude
+  uint8_t range = maxVal - minVal;
+  if (range < 30) return 0;  // Too quiet
+  
+  // Calculate center and hysteresis thresholds
+  uint8_t center = (minVal + maxVal) / 2;
+  uint8_t hysteresis = range / 6;  // ~17% of range
+  if (hysteresis < 5) hysteresis = 5;
+  
+  uint8_t threshHigh = center + hysteresis;
+  uint8_t threshLow = center - hysteresis;
+  
+  // Count rising edge crossings and measure periods
+  uint8_t crossings = 0;
+  uint16_t firstCrossing = 0;
+  uint16_t lastCrossing = 0;
+  bool aboveCenter = buffer.raw[0] > center;
+  
+  for (uint16_t i = 1; i < 256; i++) {
+    if (!aboveCenter && buffer.raw[i] > threshHigh) {
+      // Rising edge detected
+      aboveCenter = true;
+      crossings++;
+      
+      if (firstCrossing == 0) {
+        firstCrossing = i;
+      }
+      lastCrossing = i;
+    }
+    else if (aboveCenter && buffer.raw[i] < threshLow) {
+      // Falling edge
+      aboveCenter = false;
+    }
+  }
+  
+  dbgCrossings = crossings;
+  
+  // Need at least 2 crossings to measure period
+  if (crossings < 2) return 0;
+  
+  // Calculate average period in samples
+  uint16_t totalSamples = lastCrossing - firstCrossing;
+  float avgPeriodSamples = (float)totalSamples / (float)(crossings - 1);
+  
+  // Convert to frequency
+  // frequency = sampleRate / periodInSamples
+  float frequency = sampleRate / avgPeriodSamples;
+  
+  return frequency;
+}
+
+// ================== YIN Algorithm ==================
+
+float detectFrequencyYIN() {
+  int32_t runningSum = 0;
+  int16_t prev2 = 256, prev1 = 256, curr = 256;
+  int tauEstimate = -1;
+  
+  for (uint8_t tau = 1; tau < YIN_MAX_PERIOD && tauEstimate < 0; tau++) {
+    int32_t sum = 0;
+    uint8_t* p1 = buffer.raw;
+    uint8_t* p2 = buffer.raw + tau;
+    
+    for (uint8_t j = 0; j < 128; j++) {
+      int16_t delta = (int16_t)*p1++ - (int16_t)*p2++;
+      sum += delta * delta;
+    }
+    
+    int16_t d_tau = sum >> 8;
+    runningSum += d_tau;
+    
+    int16_t cmndf;
+    if (runningSum > 0) {
+      cmndf = (int16_t)(((int32_t)d_tau * tau * 256L) / runningSum);
+    } else {
+      cmndf = 256;
+    }
+    
+    prev2 = prev1;
+    prev1 = curr;
+    curr = cmndf;
+    
+    if (tau >= YIN_MIN_PERIOD + 2) {
+      if (prev1 < YIN_THRESHOLD_FP && prev1 <= prev2 && prev1 <= curr) {
+        tauEstimate = tau - 1;
+      }
+    }
+  }
+  
+  if (tauEstimate < 0) return 0;
+  
+  float betterTau = (float)tauEstimate;
+  float denom = 2.0f * ((float)prev2 - 2.0f * (float)prev1 + (float)curr);
+  if (denom != 0) {
+    betterTau += ((float)prev2 - (float)curr) / denom;
+  }
+  
+  // Using prescaler 0x05 = /32, sample rate ~38.4kHz
+  return 38461.0f / betterTau;
 }
 
 // ---------------- Setup ----------------
@@ -237,7 +349,7 @@ void setup() {
   if (menuTimer < 1 || menuTimer > 60) menuTimer = 5;
 
   bootLogoEnabled = EEPROM.read(BOOTLOGO_ADDR);
-  if (bootLogoEnabled > 1) bootLogoEnabled = 1;  // Default to enabled
+  if (bootLogoEnabled > 1) bootLogoEnabled = 1;
 
   uint8_t lastMode = EEPROM.read(EEPROM_MODE_ADDR);
   if (lastMode >= MODE_LFO && lastMode <= MODE_TUNER) mode = lastMode;
@@ -261,7 +373,7 @@ void setup() {
   TCCR2B &= B11111000;
   TCCR2B |= B00000001;
 
-  loadAllSettings();  // Load ALL mode settings from EEPROM
+  loadAllSettings();
   setupMode(mode);
 }
 
@@ -287,13 +399,12 @@ void loop() {
   if (isLongPressing && !hasSaved) {
     unsigned long d = millis() - buttonPressStart;
     if (d >= 1000) {
-      saveCurrentModeToRAM();  // Ensure current mode is in RAM
-      saveAllSettings();       // Save ALL modes to EEPROM
+      saveCurrentModeToRAM();
+      saveAllSettings();
       hasSaved = true;
     }
   }
 
-  // Enter config menu after save feedback shown (3 seconds hold)
   if (SW && !configMenuActive && !hasEnteredConfig && hasSaved && (millis() - buttonPressStart >= 3000)) {
     configMenuActive = true;
     hasEnteredConfig = true;
@@ -335,9 +446,7 @@ void loop() {
 
   byte currentParamSelect = param_select;
   if (old_mode != mode) {
-    // Save current mode settings to RAM before switching
     saveCurrentModeToRAM();
-    
     setupMode(mode);
     display.clearDisplay();
     if (currentParamSelect == 1) param_select = 1;
@@ -370,7 +479,6 @@ void drawBootAnimation() {
 
 // ================== Settings Management ==================
 
-// Save current working params to RAM array
 void saveCurrentModeToRAM() {
   uint8_t idx = mode - 1;
   if (idx < NUM_MODES) {
@@ -380,7 +488,6 @@ void saveCurrentModeToRAM() {
   }
 }
 
-// Load ALL mode settings from EEPROM into RAM
 void loadAllSettings() {
   for (uint8_t m = 0; m < NUM_MODES; m++) {
     int baseAddr = EEPROM_PARAM_SELECT_ADDR + (m * 3);
@@ -388,11 +495,9 @@ void loadAllSettings() {
     modeSettings[m].param1 = EEPROM.read(baseAddr + 1);
     modeSettings[m].param2 = EEPROM.read(baseAddr + 2);
     
-    // Validate and set defaults
     if (modeSettings[m].param_select > 3) modeSettings[m].param_select = 0;
     
-    // Mode-specific validation
-    switch (m + 1) {  // m+1 = actual mode number
+    switch (m + 1) {
       case MODE_LFO:
         modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 8);
         modeSettings[m].param2 = constrain(modeSettings[m].param2, -6, 10);
@@ -417,14 +522,14 @@ void loadAllSettings() {
         if (modeSettings[m].param2 == 0) modeSettings[m].param2 = 8;
         break;
       case MODE_TUNER:
-        modeSettings[m].param1 = 1;  // Not used anymore (hardcoded smoothing)
-        modeSettings[m].param2 = 1;  // Not used anymore (auto-range)
+        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 3);
+        if (modeSettings[m].param1 == 0) modeSettings[m].param1 = 1;
+        modeSettings[m].param2 = 1;
         break;
     }
   }
 }
 
-// Save ALL mode settings from RAM to EEPROM
 void saveAllSettings() {
   EEPROM.update(EEPROM_MODE_ADDR, mode);
   
@@ -447,7 +552,6 @@ void saveAllSettings() {
 void setupMode(uint8_t m) {
   stopADCSampling();
   
-  // Load settings from RAM array
   uint8_t idx = m - 1;
   if (idx < NUM_MODES) {
     param_select = modeSettings[idx].param_select;
@@ -459,32 +563,32 @@ void setupMode(uint8_t m) {
     case MODE_LFO:
       pinMode(FILTER_PIN, INPUT);
       analogWrite(OFFSET_PIN, 0);
-      ADCSRA = (ADCSRA & 0xF8) | 0x04;  // Standard analogRead prescaler
+      ADCSRA = (ADCSRA & 0xF8) | 0x04;
       break;
 
     case MODE_WAVE:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
-      // Will use ADC interrupt for sampling
       break;
 
     case MODE_SHOT:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
-      // Will use ADC interrupt for sampling
       break;
 
     case MODE_SPECTRUM:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, OUTPUT);
       digitalWrite(FILTER_PIN, LOW);
-      // Will use ADC interrupt for consistent FFT sampling
       break;
 
     case MODE_TUNER:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
       smoothedFrequency = 0;
+      tunerMode = param1;
+      tunerDetectionMethod = 0;
+      tunerSampleRate = 2;  // Start with medium
       break;
   }
 
@@ -492,7 +596,7 @@ void setupMode(uint8_t m) {
   rfrs = 0;
 }
 
-// ---------------- LFO Mode  ----------------
+// ---------------- LFO Mode ----------------
 void runLFOMode(bool showParams) {
   param  = constrain(param, 1, 3);
   param1 = constrain(param1, 1, 8);
@@ -526,7 +630,7 @@ void runLFOMode(bool showParams) {
   }
 }
 
-// ---------------- Wave Mode  ----------------
+// ---------------- Wave Mode ----------------
 void runWaveMode(bool showParams) {
   param  = constrain(param, 1, 3);
   param1 = constrain(param1, 1, 8);
@@ -538,15 +642,14 @@ void runWaveMode(bool showParams) {
   unsigned long interval = 50UL + (param2 - 1) * 100UL;
   
   switch (state) {
-    case 0:  // Wait for interval
+    case 0:
       if (millis() - lastUpdate >= interval) {
-        // Calculate prescaler and delay based on param1 (time/zoom)
         uint8_t prescaler, delaySkip;
         if (param1 <= 5) {
-          prescaler = 0x05;  // /32 = fastest
+          prescaler = 0x05;
           delaySkip = (6 - param1) * 2;
         } else {
-          prescaler = 0x06;  // /64
+          prescaler = 0x06;
           delaySkip = (param1 - 5) * 4;
         }
         startADCSampling(128, prescaler, delaySkip);
@@ -554,22 +657,20 @@ void runWaveMode(bool showParams) {
       }
       break;
       
-    case 1:  // Wait for samples
+    case 1:
       if (adcBufferReady) {
         lastUpdate = millis();
         state = 2;
       }
       break;
       
-    case 2:  // Draw
+    case 2:
       display.clearDisplay();
       
-      // Scale 8-bit samples (0-255) to 6-bit range (0-63) for full screen height
       for (uint8_t i = 0; i < 128; i++) {
         buffer.raw[i] = buffer.raw[i] >> 2;
       }
       
-      // Fixed: removed 63- inversion
       for (int i = 1; i < 127; i++) {
         display.drawLine(127 - i, buffer.raw[i - 1],
                          127 - (i + 1), buffer.raw[i], WHITE);
@@ -581,7 +682,7 @@ void runWaveMode(bool showParams) {
   }
 }
 
-// ---------------- Shot Mode  ----------------
+// ---------------- Shot Mode ----------------
 void runShotMode(bool showParams) {
   param  = constrain(param, 1, 2);
   param1 = constrain(param1, 1, 4);
@@ -594,7 +695,7 @@ void runShotMode(bool showParams) {
   static uint8_t state = 0;
 
   switch (state) {
-    case 0:  // Wait for trigger
+    case 0:
       if (!old_trig && trig) {
         uint8_t prescaler = 0x05 + (param1 - 1);
         if (prescaler > 0x07) prescaler = 0x07;
@@ -606,14 +707,11 @@ void runShotMode(bool showParams) {
       }
       break;
       
-    case 1:  // Wait for samples
+    case 1:
       if (adcBufferReady) {
-        // Copy samples to correct positions (10-127)
-        // Scale 8-bit (0-255) to 6-bit (0-63) for full screen height
         for (int i = 117; i >= 0; i--) {
           buffer.raw[i + 10] = buffer.raw[i] >> 2;
         }
-        // Set trigger area to mid-point
         for (int i = 0; i < 10; i++) buffer.raw[i] = 32;
         
         redrawNeeded = true;
@@ -622,13 +720,11 @@ void runShotMode(bool showParams) {
       break;
   }
 
-  // Redraw display
   if (redrawNeeded || millis() - lastUpdate >= 200) {
     lastUpdate = millis();
     redrawNeeded = false;
 
     display.clearDisplay();
-    // Fixed: removed 63- inversion
     for (int i = 1; i < 127; i++) {
       display.drawLine(i, buffer.raw[i], i + 1, buffer.raw[i + 1], WHITE);
     }
@@ -646,21 +742,20 @@ void runSpectrumMode(bool showParams) {
   static uint8_t state = 0;
   
   switch (state) {
-    case 0:  // Start sampling
+    case 0:
       if (millis() - lastUpdate >= 100) {
         startADCSampling(128, 0x06, 0);
         state = 1;
       }
       break;
       
-    case 1:  // Wait for samples
+    case 1:
       if (adcBufferReady) {
         state = 2;
       }
       break;
       
-    case 2:  // Process FFT and draw
-      // Convert 8-bit samples to signed for FFT
+    case 2:
       for (uint8_t i = 0; i < 128; i++) {
         buffer.spectrum.real[i] = (int8_t)(buffer.raw[i] - 128);
         buffer.spectrum.imag[i] = 0;
@@ -689,62 +784,7 @@ void runSpectrumMode(bool showParams) {
   }
 }
 
-// ================== TUNER ==================
-
-float detectFrequencyYIN() {
-  int32_t runningSum = 0;
-  int16_t prev2 = 256, prev1 = 256, curr = 256;
-  int tauEstimate = -1;
-  
-  for (uint8_t tau = 1; tau < YIN_MAX_PERIOD && tauEstimate < 0; tau++) {
-    int32_t sum = 0;
-    uint8_t* p1 = buffer.raw;
-    uint8_t* p2 = buffer.raw + tau;
-    
-    for (uint8_t j = 0; j < ADC_HALF_BUFFER; j++) {
-      int16_t delta = (int16_t)*p1++ - (int16_t)*p2++;
-      sum += delta * delta;
-    }
-    
-    int16_t d_tau = sum >> 8;
-    runningSum += d_tau;
-    
-    int16_t cmndf;
-    if (runningSum > 0) {
-      cmndf = (int16_t)(((int32_t)d_tau * tau * 256L) / runningSum);
-    } else {
-      cmndf = 256;
-    }
-    
-    prev2 = prev1;
-    prev1 = curr;
-    curr = cmndf;
-    
-    if (tau >= YIN_MIN_PERIOD + 2) {
-      if (prev1 < YIN_THRESHOLD_FP && prev1 <= prev2 && prev1 <= curr) {
-        tauEstimate = tau - 1;
-      }
-    }
-  }
-  
-  if (tauEstimate < 0) return 0;
-  
-  float betterTau = (float)tauEstimate;
-  float denom = 2.0f * ((float)prev2 - 2.0f * (float)prev1 + (float)curr);
-  if (denom != 0) {
-    betterTau += ((float)prev2 - (float)curr) / denom;
-  }
-  
-  float sampleRate;
-  switch (tunerAutoRange) {
-    case 1: sampleRate = 9615.0f;  break;   // LOW
-    case 2: sampleRate = 19230.0f; break;   // MID
-    case 3: sampleRate = 38461.0f; break;   // HI
-    default: sampleRate = 19230.0f; break;
-  }
-  
-  return sampleRate / betterTau;
-}
+// ================== TUNER MODE ==================
 
 void frequencyToNote(float freq, char* note, int8_t* octave, int8_t* cents) {
   static const char notes[] PROGMEM = "C C#D D#E F F#G G#A A#B ";
@@ -762,59 +802,126 @@ void frequencyToNote(float freq, char* note, int8_t* octave, int8_t* cents) {
   if (note[1] == ' ') note[1] = '\0';
 }
 
-// ---------------- Tuner Mode ----------------
 void runTunerMode(bool showParams) {
-  param = constrain(param, 1, 2);  // Only Mode selection now
+  param = constrain(param, 1, 2);
+  param1 = constrain(param1, 1, 3);  // 1=ZC, 2=YIN, 3=AUTO
+  tunerMode = param1;
 
   static unsigned long lastUpdate = 0;
   static uint8_t state = 0;
+  static float lastValidFreq = 0;
   
-  // Hardcoded smoothing factor (0.35 = good balance of response and stability)
   const float smoothingAlpha = 0.35f;
   
+  // Sample rates for different prescalers and delay skips:
+  // Prescaler 0x07 (/128) = ~9600 Hz base
+  // Prescaler 0x07 + delaySkip 1 = ~4800 Hz (for very low frequencies)
+  // Prescaler 0x06 (/64) = ~19200 Hz
+  // Prescaler 0x05 (/32) = ~38400 Hz (for YIN)
+  
   switch (state) {
-    case 0:  // Start sampling with auto-detected range
+    case 0:  // Start sampling
       if (millis() - lastUpdate >= 80) {
         uint8_t prescaler;
-        switch (tunerAutoRange) {
-          case 1: prescaler = 0x07; break;  // /128 ~9.6kHz (bass <200Hz)
-          case 2: prescaler = 0x06; break;  // /64  ~19kHz (mid 200-800Hz)
-          case 3: prescaler = 0x05; break;  // /32  ~38kHz (high >800Hz)
-          default: prescaler = 0x06; break;
+        uint8_t delaySkip;
+        
+        // Choose sample rate based on last detected frequency
+        if (tunerMode == 2) {
+          // YIN mode - always use fast rate
+          prescaler = 0x05;
+          delaySkip = 0;
+          tunerSampleRate = 3;
+          dbgSampleRate = 38461.0f;
         }
-        startADCSampling(256, prescaler, 0);
+        else if (lastValidFreq < 80 || tunerSampleRate == 1) {
+          // Very low frequency or already in slow mode
+          prescaler = 0x07;  // /128
+          delaySkip = 1;     // Extra slow
+          tunerSampleRate = 1;
+          dbgSampleRate = 4808.0f;  // 9615/2
+        }
+        else if (lastValidFreq < 200 || tunerSampleRate == 2) {
+          // Low-mid frequency
+          prescaler = 0x07;  // /128
+          delaySkip = 0;
+          tunerSampleRate = 2;
+          dbgSampleRate = 9615.0f;
+        }
+        else {
+          // Higher frequency
+          prescaler = 0x06;  // /64
+          delaySkip = 0;
+          tunerSampleRate = 3;
+          dbgSampleRate = 19230.0f;
+        }
+        
+        startADCSampling(256, prescaler, delaySkip);
         state = 1;
       }
       break;
       
-    case 1:  // Wait for samples
-      if (adcBufferReady) state = 2;
+    case 1:  // Wait for buffer
+      if (adcBufferReady) {
+        state = 2;
+      }
       break;
       
-    case 2:  // Process
+    case 2:  // Process buffer
       {
-        float rawFreq = detectFrequencyYIN();
+        float rawFreq = 0;
         
-        if (rawFreq > 30 && rawFreq < 4000) {
+        if (tunerMode == 1) {
+          // ZC only
+          rawFreq = detectFrequencyZC(dbgSampleRate);
+          tunerDetectionMethod = (rawFreq > 0) ? 1 : 0;
+        }
+        else if (tunerMode == 2) {
+          // YIN only  
+          rawFreq = detectFrequencyYIN();
+          tunerDetectionMethod = (rawFreq > 0) ? 2 : 0;
+        }
+        else {
+          // AUTO mode - try ZC first for low frequencies
+          float zcFreq = detectFrequencyZC(dbgSampleRate);
+          
+          if (zcFreq > 20 && zcFreq < 400) {
+            rawFreq = zcFreq;
+            tunerDetectionMethod = 1;
+          }
+          else {
+            // Try YIN (need to resample at higher rate)
+            // For now, just use ZC result or 0
+            rawFreq = zcFreq;
+            tunerDetectionMethod = (rawFreq > 0) ? 1 : 0;
+          }
+        }
+        
+        // Apply smoothing
+        if (rawFreq > 15 && rawFreq < 5000) {
+          lastValidFreq = rawFreq;
+          
           if (smoothedFrequency < 10) {
             smoothedFrequency = rawFreq;
           } else {
-            smoothedFrequency = smoothedFrequency * (1.0f - smoothingAlpha) + rawFreq * smoothingAlpha;
+            float diff = abs(rawFreq - smoothedFrequency) / smoothedFrequency;
+            float alpha = (diff > 0.1f) ? 0.5f : smoothingAlpha;
+            smoothedFrequency = smoothedFrequency * (1.0f - alpha) + rawFreq * alpha;
           }
           
-          // Auto-range based on detected frequency for next measurement
-          if (smoothedFrequency < 150) {
-            tunerAutoRange = 1;  // LOW - slower sample rate for bass
-          } else if (smoothedFrequency < 600) {
-            tunerAutoRange = 2;  // MID - balanced
+          // Adapt sample rate for next measurement
+          if (smoothedFrequency < 60) {
+            tunerSampleRate = 1;  // Slow
+          } else if (smoothedFrequency < 150) {
+            tunerSampleRate = 2;  // Medium
           } else {
-            tunerAutoRange = 3;  // HI - faster sample rate for treble
+            tunerSampleRate = 3;  // Fast
           }
         } else {
-          smoothedFrequency *= 0.9f;
-          // If no signal, reset to mid-range for next detection
-          if (smoothedFrequency < 20) {
-            tunerAutoRange = 2;
+          smoothedFrequency *= 0.85f;
+          if (smoothedFrequency < 15) {
+            smoothedFrequency = 0;
+            tunerDetectionMethod = 0;
+            tunerSampleRate = 2;  // Reset to medium
           }
         }
         
@@ -824,54 +931,46 @@ void runTunerMode(bool showParams) {
       break;
   }
 
-  // Update display at ~15fps
+  // === Update display ===
   static unsigned long lastDraw = 0;
-  if (millis() - lastDraw < 66) return;
+  if (millis() - lastDraw < 80) return;
   lastDraw = millis();
   
   display.clearDisplay();
   
-  // Calculate vertical offset based on whether params are shown
-  int yOffset = showParams ? 10 : 0;
+  int yOff = showParams ? 10 : 0;
   
-  if (smoothedFrequency > 30) {
+  if (smoothedFrequency > 15) {
     char note[3];
     int8_t octave, cents;
     frequencyToNote(smoothedFrequency, note, &octave, &cents);
     
-    // Calculate note width for centering (size 2 = 12px per char)
     uint8_t noteLen = strlen(note);
-    int noteWidth = (noteLen * 12) + 12;  // note chars + octave
+    int noteWidth = (noteLen * 12) + 12;
     int noteX = (128 - noteWidth) / 2;
     
-    // Draw centered note (size 2)
     display.setTextSize(2);
-    display.setCursor(noteX, yOffset + 6);
+    display.setCursor(noteX, yOff + 4);
     display.print(note);
     display.print(octave);
     
-    // Draw cents indicator - left if negative, right if positive (with margin)
     display.setTextSize(1);
     if (cents < 0) {
-      // Left side with margin
-      display.setCursor(4, yOffset + 10);
+      display.setCursor(4, yOff + 8);
       display.print(cents);
       display.print('c');
     } else if (cents > 0) {
-      // Right side with margin
       int centsX = (cents < 10) ? 110 : 104;
-      display.setCursor(centsX, yOffset + 10);
+      display.setCursor(centsX, yOff + 8);
       display.print('+');
       display.print(cents);
       display.print('c');
     } else {
-      // Centered "OK" indicator when in tune
-      display.setTextSize(1);
-      display.setCursor(110, yOffset + 10);
+      display.setCursor(110, yOff + 8);
       display.print(F("OK"));
     }
     
-    // Draw Hz below note
+    // Hz display
     display.setTextSize(1);
     char hzStr[10];
     if (smoothedFrequency < 100) {
@@ -884,33 +983,50 @@ void runTunerMode(bool showParams) {
     strcat(hzStr, "Hz");
     int hzWidth = strlen(hzStr) * 6;
     int hzX = (128 - hzWidth) / 2;
-    display.setCursor(hzX, yOffset + 26);
+    display.setCursor(hzX, yOff + 24);
     display.print(hzStr);
     
-    // Tuning indicator bar at bottom
-    int barY = showParams ? 44 : 42;
-    display.drawRect(14, barY, 100, 6, WHITE);
-    display.drawFastVLine(64, barY - 2, 10, WHITE);  // Center marker
+    // Method indicator
+    display.setCursor(116, yOff + 24);
+    if (tunerDetectionMethod == 1) display.print('Z');
+    else if (tunerDetectionMethod == 2) display.print('Y');
     
-    // Indicator position based on cents (-50 to +50 mapped to bar width)
+    // Tuning bar
+    int barY = showParams ? 54 : 44;
+    display.drawRect(14, barY, 100, 6, WHITE);
+    display.drawFastVLine(64, barY - 2, 10, WHITE);
+    
     int indicator = 64 + constrain(cents, -50, 50);
-    display.fillRect(indicator - 2, barY + 2, 5, 6, WHITE);
+    display.fillRect(indicator - 2, barY + 1, 5, 4, WHITE);
     
   } else {
-    // No signal detected
     display.setTextSize(2);
-    display.setCursor(40, yOffset + 10);
+    display.setCursor(44, yOff + 8);
     display.print(F("---"));
     
     display.setTextSize(1);
-    display.setCursor(40, yOffset + 28);
+    display.setCursor(34, yOff + 26);
     display.print(F("No signal"));
     
-    // Empty tuning bar
-    int barY = showParams ? 54 : 52;
+    int barY = showParams ? 48 : 44;
     display.drawRect(14, barY, 100, 6, WHITE);
     display.drawFastVLine(64, barY - 2, 10, WHITE);
   }
+  
+  // Debug info
+  /*
+  display.setTextSize(1);
+  int debugY = showParams ? 54 : 52;
+  display.setCursor(0, debugY);
+  display.print(dbgMin);
+  display.print('-');
+  display.print(dbgMax);
+  display.print(F(" X:"));
+  display.print(dbgCrossings);
+  display.print(F(" R:"));
+  display.print((int)(dbgSampleRate/1000));
+  display.print('k');
+  */
   
   display.setTextSize(1);
   if (showParams) drawParameterBar(true);
@@ -920,7 +1036,7 @@ void runTunerMode(bool showParams) {
 void drawParameterBar(bool showParams) {
   if (!showParams) return;
   display.setTextSize(1);
-  display.drawLine((param - 1) * 42, 8, (param - 1) * 42 + 36, 8, WHITE);
+  //display.drawLine((param - 1) * 42, 8, (param - 1) * 42 + 36, 8, WHITE);
 
   display.setTextColor((param_select == 1) ? BLACK : WHITE, (param_select == 1) ? WHITE : BLACK);
   display.setCursor(0, 0);
@@ -940,11 +1056,10 @@ void drawParameterBar(bool showParams) {
     case MODE_SHOT:    display.print(F("Time:")); break;
     case MODE_SPECTRUM:display.print(F("High:")); break;
     case MODE_TUNER:
-      // Show auto-range indicator in param1 slot
-      switch (tunerAutoRange) {
-        case 1: display.print(F("LO")); break;
-        case 2: display.print(F("MID")); break;
-        case 3: display.print(F("HI")); break;
+      switch (tunerMode) {
+        case 1: display.print(F("ZC")); break;
+        case 2: display.print(F("YIN")); break;
+        case 3: display.print(F("AUTO")); break;
       }
       break;
   }
@@ -988,22 +1103,17 @@ void configMenu() {
 
   if (newDirection != encoderDirection) encoderDirection = newDirection;
   
-  // Short press cycles through options
   if (old_SW == 0 && SW == 1) configMenuOption = (configMenuOption % 4) + 1;
 
-  // Track hold duration for exit
   static unsigned long holdStart = 0;
   if (SW && !old_SW) holdStart = millis();
   
-  // Hold 2 seconds to save and exit
   if (SW && holdStart > 0 && (millis() - holdStart >= 2000)) {
-    // Save all config settings
     EEPROM.put(ENCODER_DIR_ADDR, encoderDirection);
     EEPROM.write(OLED_ROT_ADDR, oledRotation);
     EEPROM.put(MENUTIMER_DIR_ADDR, (uint8_t)menuTimer);
     EEPROM.write(BOOTLOGO_ADDR, bootLogoEnabled);
     
-    // Also save all mode settings
     saveCurrentModeToRAM();
     saveAllSettings();
 
