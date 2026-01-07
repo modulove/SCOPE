@@ -1,13 +1,15 @@
 /**
  * @file SCOPE.ino
  * @author Modulove
- * @brief Eurorack scope + OLED flip + Tuner
- * @version 2.3
- * @date 2025-12-11
+ * @brief Eurorack scope + Tuner (Software SPI version)
+ * @date 2026-01-17
  * 
- * NEW:
- * - More reliable detection in tuner mode
- * - Still WIP
+ * MODIFICATIONS v2026
+ * - Added waveform visualization below tuner bar
+ * - Auto-scales waveform 
+ * - use fastAnalogRead() in LFO mode (faster?)
+ * - Removed SHOT mode - now 4 modes: LFO, WAVE, SPECTRUM, TUNER
+ * - Reduced code size and RAM usage
  */
 
 #include <EEPROM.h>
@@ -19,7 +21,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ---------------- Display  ----------------
+// ---------------- Display (Software SPI) ----------------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_MOSI 9
@@ -52,10 +54,9 @@ const int EEPROM_PARAM_SELECT_ADDR = 5;
 // ---------------- Modes ----------------
 #define MODE_LFO      1
 #define MODE_WAVE     2
-#define MODE_SHOT     3
-#define MODE_SPECTRUM 4
-#define MODE_TUNER    5
-#define NUM_MODES     5
+#define MODE_SPECTRUM 3
+#define MODE_TUNER    4
+#define NUM_MODES     4
 
 // ---------------- ADC Sampling System ----------------
 #define ADC_BUFFER_SIZE   256
@@ -67,21 +68,25 @@ volatile bool adcSampling = false;
 volatile uint8_t adcDelayCounter = 0;
 volatile uint8_t adcDelayTarget = 0;
 
-// ---------------- YIN Algorithm Constants ----------------
-#define YIN_THRESHOLD_FP  38
-#define YIN_MIN_PERIOD    6
-#define YIN_MAX_PERIOD    100
-
 // Tuner state
-float smoothedFrequency = 0;
-uint8_t tunerMode = 1;          // 1=ZC, 2=YIN, 3=AUTO
-uint8_t tunerDetectionMethod = 0;
+uint32_t smoothedFreqX100 = 0;  // Fixed-point frequency * 100
+uint32_t lastValidFreqX100 = 0;
 uint8_t tunerSampleRate = 2;    // 1=slow(4.8kHz), 2=med(9.6kHz), 3=fast(19kHz)
 
-// Debug values
-uint8_t dbgCrossings = 0;
-uint8_t dbgMin = 255, dbgMax = 0;
-float dbgSampleRate = 0;
+// Wave mode state
+uint8_t waveState = 0;
+unsigned long waveLastUpdate = 0;
+uint16_t waveDetectedFreq = 0;  // Integer Hz
+uint8_t waveAutoPrescaler = 0x05;
+uint8_t waveAutoDelay = 0;
+
+// Spectrum mode state
+uint8_t spectrumState = 0;
+unsigned long spectrumLastUpdate = 0;
+
+// Tuner mode state
+uint8_t tunerState = 0;
+unsigned long tunerLastUpdate = 0;
 
 // ---------------- Boot logo (PROGMEM) ----------------
 const unsigned char Modulove_Logo [] PROGMEM = {
@@ -131,7 +136,8 @@ union {
 struct ModeSettings {
   uint8_t param_select;
   uint8_t param1;
-  uint8_t param2;
+  int8_t param2;  // Signed for offset values
+  int8_t param3;  // Additional parameter (Wave mode Rfrs)
 };
 ModeSettings modeSettings[NUM_MODES];
 
@@ -140,9 +146,9 @@ uint8_t old_mode = MODE_LFO;
 uint8_t param_select = 0;
 uint8_t param = 1;
 uint8_t param1 = 2;
-uint8_t param2 = 1;
+int8_t param2 = 1;  // Signed for offset values
+int8_t param3 = 1;  // Additional parameter
 
-bool trig = 0, old_trig = 0;
 bool SW = 0, old_SW = 0;
 
 unsigned long hideTimer = 0;
@@ -150,8 +156,8 @@ unsigned long lastSaveTime = 0;
 bool hide = 0;
 int rfrs = 0;
 
-float oldPosition = -999;
-float newPosition = -999;
+int16_t oldPosition = -999;
+int16_t newPosition = -999;
 
 bool configMenuActive = false;
 byte configMenuOption = 1;
@@ -165,18 +171,17 @@ void drawBootAnimation();
 void setupMode(uint8_t mode);
 void runLFOMode(bool showParams);
 void runWaveMode(bool showParams);
-void runShotMode(bool showParams);
 void runSpectrumMode(bool showParams);
 void runTunerMode(bool showParams);
 void drawParameterBar(bool showParams);
 void configMenu();
-void saveCurrentModeToRAM();
+void saveCurrentModeToRAM(uint8_t m);
 void saveAllSettings();
 void loadAllSettings();
 void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip);
 void stopADCSampling();
-float detectFrequencyYIN();
-float detectFrequencyZC(float sampleRate);
+uint8_t fastAnalogRead();
+uint32_t detectFrequencyZC(uint16_t sampleRateX10);  // Returns freq * 100
 
 // ================== ADC Interrupt ==================
 ISR(ADC_vect) {
@@ -221,34 +226,36 @@ void stopADCSampling() {
   adcSampling = false;
 }
 
-// ================== Buffer-Based Zero-Crossing Detection ==================
-// Analyzes the buffer AFTER it's been filled by the ADC interrupt
-// Much more reliable than real-time detection
+// Fast single ADC read (8-bit, ~15µs vs ~100µs for analogRead)
+uint8_t fastAnalogRead() {
+  // Set up: AVcc ref, left-adjust, channel A0
+  ADMUX = (1 << REFS0) | (1 << ADLAR) | (ANALOG_INPUT_PIN & 0x07);
+  // Enable ADC, start conversion, prescaler 64 (~15µs conversion)
+  ADCSRA = (1 << ADEN) | (1 << ADSC) | (0x06);  // Prescaler 64
+  // Wait for conversion
+  while (ADCSRA & (1 << ADSC));
+  return ADCH;
+}
 
-float detectFrequencyZC(float sampleRate) {
-  // Find min/max in buffer for dynamic thresholding
+// ================== Buffer-Based Zero-Crossing Detection ==================
+// Returns frequency * 100 (fixed-point), sampleRateX10 = sample rate / 10
+uint32_t detectFrequencyZC(uint16_t sampleRateX10) {
   uint8_t minVal = 255, maxVal = 0;
   for (uint16_t i = 0; i < 256; i++) {
     if (buffer.raw[i] < minVal) minVal = buffer.raw[i];
     if (buffer.raw[i] > maxVal) maxVal = buffer.raw[i];
   }
   
-  dbgMin = minVal;
-  dbgMax = maxVal;
-  
-  // Need sufficient signal amplitude
   uint8_t range = maxVal - minVal;
-  if (range < 30) return 0;  // Too quiet
+  if (range < 30) return 0;
   
-  // Calculate center and hysteresis thresholds
   uint8_t center = (minVal + maxVal) / 2;
-  uint8_t hysteresis = range / 6;  // ~17% of range
+  uint8_t hysteresis = range / 6;
   if (hysteresis < 5) hysteresis = 5;
   
   uint8_t threshHigh = center + hysteresis;
   uint8_t threshLow = center - hysteresis;
   
-  // Count rising edge crossings and measure periods
   uint8_t crossings = 0;
   uint16_t firstCrossing = 0;
   uint16_t lastCrossing = 0;
@@ -256,7 +263,6 @@ float detectFrequencyZC(float sampleRate) {
   
   for (uint16_t i = 1; i < 256; i++) {
     if (!aboveCenter && buffer.raw[i] > threshHigh) {
-      // Rising edge detected
       aboveCenter = true;
       crossings++;
       
@@ -266,75 +272,20 @@ float detectFrequencyZC(float sampleRate) {
       lastCrossing = i;
     }
     else if (aboveCenter && buffer.raw[i] < threshLow) {
-      // Falling edge
       aboveCenter = false;
     }
   }
   
-  dbgCrossings = crossings;
-  
-  // Need at least 2 crossings to measure period
   if (crossings < 2) return 0;
   
-  // Calculate average period in samples
   uint16_t totalSamples = lastCrossing - firstCrossing;
-  float avgPeriodSamples = (float)totalSamples / (float)(crossings - 1);
   
-  // Convert to frequency
-  // frequency = sampleRate / periodInSamples
-  float frequency = sampleRate / avgPeriodSamples;
+  // freq * 100 = (sampleRate * 100) / avgPeriod
+  // = (sampleRateX10 * 10 * 100 * (crossings-1)) / totalSamples
+  // = (sampleRateX10 * 1000 * (crossings-1)) / totalSamples
+  uint32_t freqX100 = ((uint32_t)sampleRateX10 * 1000UL * (crossings - 1)) / totalSamples;
   
-  return frequency;
-}
-
-// ================== YIN Algorithm ==================
-
-float detectFrequencyYIN() {
-  int32_t runningSum = 0;
-  int16_t prev2 = 256, prev1 = 256, curr = 256;
-  int tauEstimate = -1;
-  
-  for (uint8_t tau = 1; tau < YIN_MAX_PERIOD && tauEstimate < 0; tau++) {
-    int32_t sum = 0;
-    uint8_t* p1 = buffer.raw;
-    uint8_t* p2 = buffer.raw + tau;
-    
-    for (uint8_t j = 0; j < 128; j++) {
-      int16_t delta = (int16_t)*p1++ - (int16_t)*p2++;
-      sum += delta * delta;
-    }
-    
-    int16_t d_tau = sum >> 8;
-    runningSum += d_tau;
-    
-    int16_t cmndf;
-    if (runningSum > 0) {
-      cmndf = (int16_t)(((int32_t)d_tau * tau * 256L) / runningSum);
-    } else {
-      cmndf = 256;
-    }
-    
-    prev2 = prev1;
-    prev1 = curr;
-    curr = cmndf;
-    
-    if (tau >= YIN_MIN_PERIOD + 2) {
-      if (prev1 < YIN_THRESHOLD_FP && prev1 <= prev2 && prev1 <= curr) {
-        tauEstimate = tau - 1;
-      }
-    }
-  }
-  
-  if (tauEstimate < 0) return 0;
-  
-  float betterTau = (float)tauEstimate;
-  float denom = 2.0f * ((float)prev2 - 2.0f * (float)prev1 + (float)curr);
-  if (denom != 0) {
-    betterTau += ((float)prev2 - (float)curr) / denom;
-  }
-  
-  // Using prescaler 0x05 = /32, sample rate ~38.4kHz
-  return 38461.0f / betterTau;
+  return freqX100;
 }
 
 // ---------------- Setup ----------------
@@ -399,7 +350,7 @@ void loop() {
   if (isLongPressing && !hasSaved) {
     unsigned long d = millis() - buttonPressStart;
     if (d >= 1000) {
-      saveCurrentModeToRAM();
+      saveCurrentModeToRAM(mode);
       saveAllSettings();
       hasSaved = true;
     }
@@ -419,11 +370,14 @@ void loop() {
 
   newPosition = encoderDirection * encoder.read();
 
-  if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
-  else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
+  // Wave mode has 4 params, others have 3
+  uint8_t maxParam = (mode == MODE_WAVE) ? 4 : 3;
 
-  mode = constrain(mode, 1, 5);
-  param = constrain(param, 1, 3);
+  if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
+  else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= maxParam)) { param_select = param; hideTimer = millis(); }
+
+  mode = constrain(mode, 1, NUM_MODES);
+  param = constrain(param, 1, maxParam);
 
   newPosition = encoderDirection * encoder.read();
   if ((newPosition - 3) / 4 > oldPosition / 4) {
@@ -433,6 +387,7 @@ void loop() {
       case 1: mode--;  break;
       case 2: param1--;break;
       case 3: param2--;break;
+      case 4: param3--;break;
     }
   } else if ((newPosition + 3) / 4 < oldPosition / 4) {
     oldPosition = newPosition; hideTimer = millis();
@@ -441,12 +396,46 @@ void loop() {
       case 1: mode++;  break;
       case 2: param1++;break;
       case 3: param2++;break;
+      case 4: param3++;break;
     }
+  }
+
+  // Parameter wrapping
+  mode = constrain(mode, 1, NUM_MODES);
+  if (mode != MODE_WAVE && param > 3) param = 3;
+  
+  switch (mode) {
+    case MODE_LFO:
+      if (param1 < 1) param1 = 8;
+      if (param1 > 8) param1 = 1;
+      if (param2 < -6) param2 = 10;
+      if (param2 > 10) param2 = -6;
+      break;
+    case MODE_WAVE:
+      // param1: 1-9 (1-8 = manual, 9 = AUTO)
+      if (param1 < 1) param1 = 9;
+      if (param1 > 9) param1 = 1;
+      // param2: -6 to 10 (offset)
+      if (param2 < -6) param2 = 10;
+      if (param2 > 10) param2 = -6;
+      // param3: 1-6 (refresh rate)
+      if (param3 < 1) param3 = 6;
+      if (param3 > 6) param3 = 1;
+      break;
+    case MODE_SPECTRUM:
+      if (param1 < 1) param1 = 4;
+      if (param1 > 4) param1 = 1;
+      if (param2 < 1) param2 = 8;
+      if (param2 > 8) param2 = 1;
+      break;
+    case MODE_TUNER:
+      // No adjustable parameters - ZC only
+      break;
   }
 
   byte currentParamSelect = param_select;
   if (old_mode != mode) {
-    saveCurrentModeToRAM();
+    saveCurrentModeToRAM(old_mode);  // Save OLD mode's settings before switching
     setupMode(mode);
     display.clearDisplay();
     if (currentParamSelect == 1) param_select = 1;
@@ -459,7 +448,6 @@ void loop() {
   switch (mode) {
     case MODE_LFO:      runLFOMode(showParams); break;
     case MODE_WAVE:     runWaveMode(showParams); break;
-    case MODE_SHOT:     runShotMode(showParams); break;
     case MODE_SPECTRUM: runSpectrumMode(showParams); break;
     case MODE_TUNER:    runTunerMode(showParams); break;
   }
@@ -479,23 +467,27 @@ void drawBootAnimation() {
 
 // ================== Settings Management ==================
 
-void saveCurrentModeToRAM() {
-  uint8_t idx = mode - 1;
+void saveCurrentModeToRAM(uint8_t m) {
+  uint8_t idx = m - 1;
   if (idx < NUM_MODES) {
     modeSettings[idx].param_select = param_select;
     modeSettings[idx].param1 = param1;
     modeSettings[idx].param2 = param2;
+    modeSettings[idx].param3 = param3;
   }
 }
 
 void loadAllSettings() {
   for (uint8_t m = 0; m < NUM_MODES; m++) {
-    int baseAddr = EEPROM_PARAM_SELECT_ADDR + (m * 3);
+    int baseAddr = EEPROM_PARAM_SELECT_ADDR + (m * 4);  // 4 bytes per mode now
     modeSettings[m].param_select = EEPROM.read(baseAddr);
     modeSettings[m].param1 = EEPROM.read(baseAddr + 1);
-    modeSettings[m].param2 = EEPROM.read(baseAddr + 2);
+    modeSettings[m].param2 = (int8_t)EEPROM.read(baseAddr + 2);
+    modeSettings[m].param3 = (int8_t)EEPROM.read(baseAddr + 3);
     
-    if (modeSettings[m].param_select > 3) modeSettings[m].param_select = 0;
+    // Validate param_select based on mode
+    uint8_t maxParamSelect = (m + 1 == MODE_WAVE) ? 4 : 3;
+    if (modeSettings[m].param_select > maxParamSelect) modeSettings[m].param_select = 0;
     
     switch (m + 1) {
       case MODE_LFO:
@@ -503,28 +495,28 @@ void loadAllSettings() {
         modeSettings[m].param2 = constrain(modeSettings[m].param2, -6, 10);
         if (modeSettings[m].param1 == 0) modeSettings[m].param1 = 4;
         if (modeSettings[m].param2 == 0) modeSettings[m].param2 = 1;
+        modeSettings[m].param3 = 1;
         break;
       case MODE_WAVE:
-        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 8);
-        modeSettings[m].param2 = constrain(modeSettings[m].param2, 1, 6);
+        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 9);  // 9 = AUTO
+        modeSettings[m].param2 = constrain(modeSettings[m].param2, -6, 10);
+        modeSettings[m].param3 = constrain(modeSettings[m].param3, 1, 6);
         if (modeSettings[m].param1 == 0) modeSettings[m].param1 = 8;
         if (modeSettings[m].param2 == 0) modeSettings[m].param2 = 1;
-        break;
-      case MODE_SHOT:
-        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 4);
-        modeSettings[m].param2 = 1;
-        if (modeSettings[m].param1 == 0) modeSettings[m].param1 = 2;
+        if (modeSettings[m].param3 == 0) modeSettings[m].param3 = 1;
         break;
       case MODE_SPECTRUM:
         modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 4);
         modeSettings[m].param2 = constrain(modeSettings[m].param2, 1, 8);
         if (modeSettings[m].param1 == 0) modeSettings[m].param1 = 1;
         if (modeSettings[m].param2 == 0) modeSettings[m].param2 = 8;
+        modeSettings[m].param3 = 1;
         break;
       case MODE_TUNER:
-        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 3);
-        if (modeSettings[m].param1 == 0) modeSettings[m].param1 = 1;
+        // No adjustable parameters - ZC only
+        modeSettings[m].param1 = 1;
         modeSettings[m].param2 = 1;
+        modeSettings[m].param3 = 1;
         break;
     }
   }
@@ -534,10 +526,11 @@ void saveAllSettings() {
   EEPROM.update(EEPROM_MODE_ADDR, mode);
   
   for (uint8_t m = 0; m < NUM_MODES; m++) {
-    int baseAddr = EEPROM_PARAM_SELECT_ADDR + (m * 3);
+    int baseAddr = EEPROM_PARAM_SELECT_ADDR + (m * 4);  // 4 bytes per mode now
     EEPROM.update(baseAddr, modeSettings[m].param_select);
     EEPROM.update(baseAddr + 1, modeSettings[m].param1);
     EEPROM.update(baseAddr + 2, modeSettings[m].param2);
+    EEPROM.update(baseAddr + 3, modeSettings[m].param3);
   }
 
   display.fillRect(0, 54, 128, 10, WHITE);
@@ -557,6 +550,7 @@ void setupMode(uint8_t m) {
     param_select = modeSettings[idx].param_select;
     param1 = modeSettings[idx].param1;
     param2 = modeSettings[idx].param2;
+    param3 = modeSettings[idx].param3;
   }
 
   switch (m) {
@@ -569,26 +563,31 @@ void setupMode(uint8_t m) {
     case MODE_WAVE:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
+      // Reset wave mode state machine
+      waveState = 0;
+      waveLastUpdate = 0;
+      waveDetectedFreq = 0;
+      waveAutoPrescaler = 0x05;
+      waveAutoDelay = 4;
       break;
-
-    case MODE_SHOT:
-      analogWrite(OFFSET_PIN, 127);
-      pinMode(FILTER_PIN, INPUT);
-      break;
-
+      
     case MODE_SPECTRUM:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, OUTPUT);
       digitalWrite(FILTER_PIN, LOW);
+      // Reset spectrum state machine
+      spectrumState = 0;
+      spectrumLastUpdate = 0;
       break;
 
     case MODE_TUNER:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
-      smoothedFrequency = 0;
-      tunerMode = param1;
-      tunerDetectionMethod = 0;
-      tunerSampleRate = 2;  // Start with medium
+      smoothedFreqX100 = 0;
+      lastValidFreqX100 = 0;
+      tunerSampleRate = 2;
+      tunerState = 0;
+      tunerLastUpdate = 0;
       break;
   }
 
@@ -602,13 +601,13 @@ void runLFOMode(bool showParams) {
   param1 = constrain(param1, 1, 8);
   param2 = constrain(param2, -6, 10);
 
-  uint8_t currentSample = analogRead(ANALOG_INPUT_PIN) >> 4;
+  uint8_t currentSample = fastAnalogRead() >> 2;  // 8-bit to 6-bit (0-63)
 
   memmove(&buffer.raw[1], &buffer.raw[0], 127);
   buffer.raw[0] = currentSample;
 
   static unsigned long lastDraw = 0;
-  if (millis() - lastDraw >= 50) {
+  if (millis() - lastDraw >= 30) {
     lastDraw = millis();
     display.clearDisplay();
 
@@ -631,104 +630,188 @@ void runLFOMode(bool showParams) {
 }
 
 // ---------------- Wave Mode ----------------
-void runWaveMode(bool showParams) {
-  param  = constrain(param, 1, 3);
-  param1 = constrain(param1, 1, 8);
-  param2 = constrain(param2, 1, 6);
+// param1: 1-8 = manual timebase, 9 = AUTO
+// param2: -6 to 10 = vertical offset
+// param3: 1-6 = refresh rate
 
-  static unsigned long lastUpdate = 0;
-  static uint8_t state = 0;
+void runWaveMode(bool showParams) {
+  param  = constrain(param, 1, 4);  // 4 menu items in Wave mode
+  param1 = constrain(param1, 1, 9);  // 9 = AUTO mode
+  param2 = constrain(param2, -6, 10);  // Offset
+  param3 = constrain(param3, 1, 6);  // Refresh rate
+
+  unsigned long interval = 20UL + (param3 - 1) * 10UL;  // 20-70ms based on Rfrs
+  bool autoMode = (param1 == 9);
+  int voff = (param2 - 1) * 4;  // Vertical offset (scaled for 64px height)
   
-  unsigned long interval = 50UL + (param2 - 1) * 100UL;
-  
-  switch (state) {
-    case 0:
-      if (millis() - lastUpdate >= interval) {
+  switch (waveState) {
+    case 0:  // Start sampling
+      if (millis() - waveLastUpdate >= interval) {
         uint8_t prescaler, delaySkip;
-        if (param1 <= 5) {
-          prescaler = 0x05;
-          delaySkip = (6 - param1) * 2;
+        
+        if (autoMode) {
+          // Use auto-calculated values
+          prescaler = waveAutoPrescaler;
+          delaySkip = waveAutoDelay;
         } else {
-          prescaler = 0x06;
-          delaySkip = (param1 - 5) * 4;
+          // Manual timebase: param1 1-8 controls speed
+          if (param1 <= 5) {
+            prescaler = 0x05;  // /32 = fast
+            delaySkip = (6 - param1) * 2;
+          } else {
+            prescaler = 0x06;  // /64 = slower
+            delaySkip = (param1 - 5) * 4;
+          }
         }
         startADCSampling(128, prescaler, delaySkip);
-        state = 1;
+        waveState = 1;
       }
       break;
       
-    case 1:
+    case 1:  // Wait for buffer
       if (adcBufferReady) {
-        lastUpdate = millis();
-        state = 2;
+        waveState = 2;
       }
       break;
       
-    case 2:
-      display.clearDisplay();
-      
-      for (uint8_t i = 0; i < 128; i++) {
-        buffer.raw[i] = buffer.raw[i] >> 2;
-      }
-      
-      for (int i = 1; i < 127; i++) {
-        display.drawLine(127 - i, buffer.raw[i - 1],
-                         127 - (i + 1), buffer.raw[i], WHITE);
-      }
-      
-      if (showParams) drawParameterBar(true);
-      state = 0;
-      break;
-  }
-}
-
-// ---------------- Shot Mode ----------------
-void runShotMode(bool showParams) {
-  param  = constrain(param, 1, 2);
-  param1 = constrain(param1, 1, 4);
-
-  old_trig = trig;
-  trig = digitalRead(TRIGGER_PIN);
-
-  static bool redrawNeeded = true;
-  static unsigned long lastUpdate = 0;
-  static uint8_t state = 0;
-
-  switch (state) {
-    case 0:
-      if (!old_trig && trig) {
-        uint8_t prescaler = 0x05 + (param1 - 1);
-        if (prescaler > 0x07) prescaler = 0x07;
-        
-        uint8_t delaySkip = (param1 > 2) ? (param1 - 2) * 2 : 0;
-        
-        startADCSampling(118, prescaler, delaySkip);
-        state = 1;
-      }
-      break;
-      
-    case 1:
-      if (adcBufferReady) {
-        for (int i = 117; i >= 0; i--) {
-          buffer.raw[i + 10] = buffer.raw[i] >> 2;
+    case 2:  // Process and display
+      {
+        // Find trigger point (rising edge through center)
+        uint8_t minVal = 255, maxVal = 0;
+        for (uint8_t i = 0; i < 128; i++) {
+          if (buffer.raw[i] < minVal) minVal = buffer.raw[i];
+          if (buffer.raw[i] > maxVal) maxVal = buffer.raw[i];
         }
-        for (int i = 0; i < 10; i++) buffer.raw[i] = 32;
         
-        redrawNeeded = true;
-        state = 0;
+        uint8_t center = (minVal + maxVal) / 2;
+        uint8_t triggerIdx = 0;
+        
+        // Look for rising edge crossing center
+        uint8_t hysteresis = (maxVal - minVal) / 8;
+        if (hysteresis < 3) hysteresis = 3;
+        uint8_t threshLow = center - hysteresis;
+        uint8_t threshHigh = center + hysteresis;
+        
+        bool belowThresh = buffer.raw[0] < threshLow;
+        for (uint8_t i = 1; i < 64; i++) {
+          if (belowThresh && buffer.raw[i] > threshHigh) {
+            triggerIdx = i;
+            break;
+          }
+          if (buffer.raw[i] < threshLow) belowThresh = true;
+        }
+        
+        // AUTO mode frequency detection and timebase adjustment
+        if (autoMode) {
+          // Count zero crossings to estimate frequency
+          uint8_t crossings = 0;
+          uint8_t firstCross = 0, lastCross = 0;
+          bool above = buffer.raw[0] > center;
+          
+          for (uint8_t i = 1; i < 128; i++) {
+            if (!above && buffer.raw[i] > threshHigh) {
+              above = true;
+              crossings++;
+              if (firstCross == 0) firstCross = i;
+              lastCross = i;
+            } else if (above && buffer.raw[i] < threshLow) {
+              above = false;
+            }
+          }
+          
+          // Calculate sample rate x10 based on current settings
+          // Base rates: 0x05=38461, 0x06=19230, 0x07=9615
+          uint16_t sampleRateX10;
+          if (waveAutoPrescaler == 0x05) {
+            sampleRateX10 = 38461 / (1 + waveAutoDelay);  // Approximation
+          } else if (waveAutoPrescaler == 0x06) {
+            sampleRateX10 = 19230 / (1 + waveAutoDelay);
+          } else {
+            sampleRateX10 = 9615 / (1 + waveAutoDelay);
+          }
+          
+          if (crossings >= 2) {
+            // avgPeriod = (lastCross - firstCross) / (crossings - 1)
+            // freq = sampleRate / avgPeriod
+            // freq = sampleRate * (crossings-1) / (lastCross - firstCross)
+            uint16_t periodSamples = lastCross - firstCross;
+            waveDetectedFreq = ((uint32_t)sampleRateX10 * (crossings - 1)) / periodSamples;
+            
+            // Target: 1.5-2.5 cycles visible (48-80 samples per cycle)
+            // samplesPerCycle = periodSamples / (crossings - 1)
+            uint16_t samplesPerCycle = periodSamples / (crossings - 1);
+            
+            if (samplesPerCycle < 30) {
+              // Too fast - need slower sample rate
+              if (waveAutoDelay < 15) {
+                waveAutoDelay++;
+              } else if (waveAutoPrescaler < 0x07) {
+                waveAutoPrescaler++;
+                waveAutoDelay = 0;
+              }
+            } else if (samplesPerCycle > 90) {
+              // Too slow - need faster sample rate
+              if (waveAutoDelay > 0) {
+                waveAutoDelay--;
+              } else if (waveAutoPrescaler > 0x05) {
+                waveAutoPrescaler--;
+                waveAutoDelay = 8;
+              }
+            }
+          } else if (crossings < 1) {
+            // No crossings detected - signal too slow, slow down sampling
+            if (waveAutoDelay < 15) {
+              waveAutoDelay += 2;
+            } else if (waveAutoPrescaler < 0x07) {
+              waveAutoPrescaler++;
+              waveAutoDelay = 4;
+            }
+            waveDetectedFreq = 0;
+          }
+        }
+        
+        // Scale samples to display height
+        display.clearDisplay();
+        
+        for (uint8_t i = 0; i < 128; i++) {
+          buffer.raw[i] = buffer.raw[i] >> 2;  // Scale to 0-63
+        }
+        
+        // Draw waveform from trigger point with offset
+        uint8_t maxDraw = 127 - triggerIdx;
+        if (maxDraw > 127) maxDraw = 127;
+        
+        for (uint8_t i = 0; i < maxDraw; i++) {
+          uint8_t idx1 = triggerIdx + i;
+          uint8_t idx2 = triggerIdx + i + 1;
+          if (idx2 < 128) {
+            int y1 = constrain(buffer.raw[idx1] + voff, 0, 63);
+            int y2 = constrain(buffer.raw[idx2] + voff, 0, 63);
+            display.drawLine(i, y1, i + 1, y2, WHITE);
+          }
+        }
+        
+        // Show frequency in AUTO mode
+        if (autoMode && waveDetectedFreq > 1) {
+          display.setTextSize(1);
+          display.setTextColor(WHITE, BLACK);
+          display.setCursor(80, 56);
+          if (waveDetectedFreq < 1000) {
+            display.print(waveDetectedFreq);
+            display.print(F("Hz"));
+          } else {
+            display.print(waveDetectedFreq / 1000);
+            display.print('.');
+            display.print((waveDetectedFreq % 1000) / 100);
+            display.print(F("k"));
+          }
+        }
+        
+        if (showParams) drawParameterBar(true);
+        waveLastUpdate = millis();
+        waveState = 0;
       }
       break;
-  }
-
-  if (redrawNeeded || millis() - lastUpdate >= 200) {
-    lastUpdate = millis();
-    redrawNeeded = false;
-
-    display.clearDisplay();
-    for (int i = 1; i < 127; i++) {
-      display.drawLine(i, buffer.raw[i], i + 1, buffer.raw[i + 1], WHITE);
-    }
-    if (showParams) drawParameterBar(true);
   }
 }
 
@@ -737,21 +820,18 @@ void runSpectrumMode(bool showParams) {
   param  = constrain(param, 1, 3);
   param1 = constrain(param1, 1, 4);
   param2 = constrain(param2, 1, 8);
-
-  static unsigned long lastUpdate = 0;
-  static uint8_t state = 0;
   
-  switch (state) {
+  switch (spectrumState) {
     case 0:
-      if (millis() - lastUpdate >= 100) {
+      if (millis() - spectrumLastUpdate >= 50) {
         startADCSampling(128, 0x06, 0);
-        state = 1;
+        spectrumState = 1;
       }
       break;
       
     case 1:
       if (adcBufferReady) {
-        state = 2;
+        spectrumState = 2;
       }
       break;
       
@@ -778,160 +858,170 @@ void runSpectrumMode(bool showParams) {
       }
 
       if (showParams) drawParameterBar(true);
-      lastUpdate = millis();
-      state = 0;
+      spectrumLastUpdate = millis();
+      spectrumState = 0;
       break;
   }
 }
 
 // ================== TUNER MODE ==================
 
-void frequencyToNote(float freq, char* note, int8_t* octave, int8_t* cents) {
-  static const char notes[] PROGMEM = "C C#D D#E F F#G G#A A#B ";
+// Note frequencies * 100 for octave 4 (C4 to B4) - stored in PROGMEM
+const uint16_t noteFreqX100[] PROGMEM = {
+  26163,  // C4  = 261.63 Hz
+  27718,  // C#4 = 277.18 Hz
+  29366,  // D4  = 293.66 Hz
+  31113,  // D#4 = 311.13 Hz
+  32963,  // E4  = 329.63 Hz
+  34923,  // F4  = 349.23 Hz
+  36999,  // F#4 = 369.99 Hz
+  39200,  // G4  = 392.00 Hz
+  41530,  // G#4 = 415.30 Hz
+  44000,  // A4  = 440.00 Hz
+  46616,  // A#4 = 466.16 Hz
+  49388   // B4  = 493.88 Hz
+};
+
+// Convert frequency (x100) to note name, octave, and cents deviation
+void frequencyToNote(uint32_t freqX100, char* note, int8_t* octave, int8_t* cents) {
+  static const char noteNames[] PROGMEM = "C C#D D#E F F#G G#A A#B ";
   
-  float noteNum = 12.0f * log(freq / 440.0f) / log(2.0f) + 69.0f;
-  int midiNote = (int)(noteNum + 0.5f);
+  if (freqX100 < 1635) {  // Below C0 (~16.35 Hz)
+    note[0] = '-'; note[1] = '\0';
+    *octave = 0; *cents = 0;
+    return;
+  }
   
-  *cents = (int8_t)((noteNum - midiNote) * 100.0f);
-  *octave = (midiNote / 12) - 1;
+  // Normalize to octave 4 (C4=261.63 to B4=493.88, freqX100: 26163-49388)
+  *octave = 4;
+  uint32_t normFreq = freqX100;
   
-  uint8_t idx = (midiNote % 12) * 2;
-  note[0] = pgm_read_byte(&notes[idx]);
-  note[1] = pgm_read_byte(&notes[idx + 1]);
+  while (normFreq < 26163 && *octave > 0) {
+    normFreq *= 2;
+    (*octave)--;
+  }
+  while (normFreq >= 52325 && *octave < 8) {  // 52325 = C5 * 100
+    normFreq /= 2;
+    (*octave)++;
+  }
+  
+  // Find closest note by linear search
+  uint8_t closestNote = 0;
+  uint32_t minDiff = 0xFFFFFFFF;
+  
+  for (uint8_t i = 0; i < 12; i++) {
+    uint16_t noteFreq = pgm_read_word(&noteFreqX100[i]);
+    uint32_t diff = (normFreq > noteFreq) ? (normFreq - noteFreq) : (noteFreq - normFreq);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closestNote = i;
+    }
+  }
+  
+  // Get note name
+  uint8_t idx = closestNote * 2;
+  note[0] = pgm_read_byte(&noteNames[idx]);
+  note[1] = pgm_read_byte(&noteNames[idx + 1]);
   note[2] = '\0';
   if (note[1] == ' ') note[1] = '\0';
+  
+  // Calculate cents deviation: cents = 1200 * log2(actual/target)
+  // Approximation: cents ≈ (actual - target) * 1731 / target
+  // (1731 ≈ 1200 / ln(2) * 0.01 for small deviations)
+  uint16_t targetFreq = pgm_read_word(&noteFreqX100[closestNote]);
+  int32_t diff = (int32_t)normFreq - (int32_t)targetFreq;
+  *cents = (int8_t)((diff * 173L) / (int32_t)targetFreq);
+  *cents = constrain(*cents, -50, 50);
 }
 
 void runTunerMode(bool showParams) {
   param = constrain(param, 1, 2);
-  param1 = constrain(param1, 1, 3);  // 1=ZC, 2=YIN, 3=AUTO
-  tunerMode = param1;
-
-  static unsigned long lastUpdate = 0;
-  static uint8_t state = 0;
-  static float lastValidFreq = 0;
   
-  const float smoothingAlpha = 0.35f;
+  // Sample rate selection: sampleRateX10 values
+  // 1=slow: 4808/10=481, 2=med: 9615/10=962, 3=fast: 19230/10=1923
+  static const uint16_t sampleRates[] = {481, 962, 1923};
   
-  // Sample rates for different prescalers and delay skips:
-  // Prescaler 0x07 (/128) = ~9600 Hz base
-  // Prescaler 0x07 + delaySkip 1 = ~4800 Hz (for very low frequencies)
-  // Prescaler 0x06 (/64) = ~19200 Hz
-  // Prescaler 0x05 (/32) = ~38400 Hz (for YIN)
-  
-  switch (state) {
-    case 0:  // Start sampling
-      if (millis() - lastUpdate >= 80) {
+  switch (tunerState) {
+    case 0:
+      if (millis() - tunerLastUpdate >= 40) {
         uint8_t prescaler;
         uint8_t delaySkip;
         
-        // Choose sample rate based on last detected frequency
-        if (tunerMode == 2) {
-          // YIN mode - always use fast rate
-          prescaler = 0x05;
-          delaySkip = 0;
-          tunerSampleRate = 3;
-          dbgSampleRate = 38461.0f;
-        }
-        else if (lastValidFreq < 80 || tunerSampleRate == 1) {
-          // Very low frequency or already in slow mode
-          prescaler = 0x07;  // /128
-          delaySkip = 1;     // Extra slow
+        // Adaptive sample rate based on last detected frequency
+        if (lastValidFreqX100 < 8000 || tunerSampleRate == 1) {  // < 80 Hz
+          prescaler = 0x07;
+          delaySkip = 1;
           tunerSampleRate = 1;
-          dbgSampleRate = 4808.0f;  // 9615/2
         }
-        else if (lastValidFreq < 200 || tunerSampleRate == 2) {
-          // Low-mid frequency
-          prescaler = 0x07;  // /128
+        else if (lastValidFreqX100 < 20000 || tunerSampleRate == 2) {  // < 200 Hz
+          prescaler = 0x07;
           delaySkip = 0;
           tunerSampleRate = 2;
-          dbgSampleRate = 9615.0f;
         }
         else {
-          // Higher frequency
-          prescaler = 0x06;  // /64
+          prescaler = 0x06;
           delaySkip = 0;
           tunerSampleRate = 3;
-          dbgSampleRate = 19230.0f;
         }
         
         startADCSampling(256, prescaler, delaySkip);
-        state = 1;
+        tunerState = 1;
       }
       break;
       
-    case 1:  // Wait for buffer
+    case 1:
       if (adcBufferReady) {
-        state = 2;
+        tunerState = 2;
       }
       break;
       
-    case 2:  // Process buffer
+    case 2:
       {
-        float rawFreq = 0;
+        uint32_t rawFreqX100 = detectFrequencyZC(sampleRates[tunerSampleRate - 1]);
         
-        if (tunerMode == 1) {
-          // ZC only
-          rawFreq = detectFrequencyZC(dbgSampleRate);
-          tunerDetectionMethod = (rawFreq > 0) ? 1 : 0;
-        }
-        else if (tunerMode == 2) {
-          // YIN only  
-          rawFreq = detectFrequencyYIN();
-          tunerDetectionMethod = (rawFreq > 0) ? 2 : 0;
-        }
-        else {
-          // AUTO mode - try ZC first for low frequencies
-          float zcFreq = detectFrequencyZC(dbgSampleRate);
+        if (rawFreqX100 > 1500 && rawFreqX100 < 500000) {  // 15-5000 Hz
+          lastValidFreqX100 = rawFreqX100;
           
-          if (zcFreq > 20 && zcFreq < 400) {
-            rawFreq = zcFreq;
-            tunerDetectionMethod = 1;
-          }
-          else {
-            // Try YIN (need to resample at higher rate)
-            // For now, just use ZC result or 0
-            rawFreq = zcFreq;
-            tunerDetectionMethod = (rawFreq > 0) ? 1 : 0;
-          }
-        }
-        
-        // Apply smoothing
-        if (rawFreq > 15 && rawFreq < 5000) {
-          lastValidFreq = rawFreq;
-          
-          if (smoothedFrequency < 10) {
-            smoothedFrequency = rawFreq;
+          // Smoothing with fixed-point
+          if (smoothedFreqX100 < 1000) {
+            smoothedFreqX100 = rawFreqX100;
           } else {
-            float diff = abs(rawFreq - smoothedFrequency) / smoothedFrequency;
-            float alpha = (diff > 0.1f) ? 0.5f : smoothingAlpha;
-            smoothedFrequency = smoothedFrequency * (1.0f - alpha) + rawFreq * alpha;
+            // Calculate difference percentage (x100)
+            uint32_t diffPercent = 0;
+            if (rawFreqX100 > smoothedFreqX100) {
+              diffPercent = ((rawFreqX100 - smoothedFreqX100) * 100) / smoothedFreqX100;
+            } else {
+              diffPercent = ((smoothedFreqX100 - rawFreqX100) * 100) / smoothedFreqX100;
+            }
+            
+            // alpha = 50% for large changes, 35% for small changes
+            uint8_t alpha = (diffPercent > 10) ? 50 : 35;
+            smoothedFreqX100 = (smoothedFreqX100 * (100 - alpha) + rawFreqX100 * alpha) / 100;
           }
           
-          // Adapt sample rate for next measurement
-          if (smoothedFrequency < 60) {
-            tunerSampleRate = 1;  // Slow
-          } else if (smoothedFrequency < 150) {
-            tunerSampleRate = 2;  // Medium
+          // Adjust sample rate for next reading
+          if (smoothedFreqX100 < 6000) {
+            tunerSampleRate = 1;
+          } else if (smoothedFreqX100 < 15000) {
+            tunerSampleRate = 2;
           } else {
-            tunerSampleRate = 3;  // Fast
+            tunerSampleRate = 3;
           }
         } else {
-          smoothedFrequency *= 0.85f;
-          if (smoothedFrequency < 15) {
-            smoothedFrequency = 0;
-            tunerDetectionMethod = 0;
-            tunerSampleRate = 2;  // Reset to medium
+          // Decay smoothed value when no signal
+          smoothedFreqX100 = (smoothedFreqX100 * 85) / 100;
+          if (smoothedFreqX100 < 1500) {
+            smoothedFreqX100 = 0;
+            tunerSampleRate = 2;
           }
         }
         
-        lastUpdate = millis();
-        state = 0;
+        tunerLastUpdate = millis();
+        tunerState = 0;
       }
       break;
   }
 
-  // === Update display ===
   static unsigned long lastDraw = 0;
   if (millis() - lastDraw < 80) return;
   lastDraw = millis();
@@ -940,10 +1030,10 @@ void runTunerMode(bool showParams) {
   
   int yOff = showParams ? 10 : 0;
   
-  if (smoothedFrequency > 15) {
+  if (smoothedFreqX100 > 1500) {
     char note[3];
     int8_t octave, cents;
-    frequencyToNote(smoothedFrequency, note, &octave, &cents);
+    frequencyToNote(smoothedFreqX100, note, &octave, &cents);
     
     uint8_t noteLen = strlen(note);
     int noteWidth = (noteLen * 12) + 12;
@@ -970,34 +1060,52 @@ void runTunerMode(bool showParams) {
       display.print(F("OK"));
     }
     
-    // Hz display
+    // Display frequency
     display.setTextSize(1);
-    char hzStr[10];
-    if (smoothedFrequency < 100) {
-      dtostrf(smoothedFrequency, 4, 1, hzStr);
-    } else if (smoothedFrequency < 1000) {
-      dtostrf(smoothedFrequency, 3, 0, hzStr);
+    uint16_t freqHz = smoothedFreqX100 / 100;
+    uint8_t freqDec = (smoothedFreqX100 % 100) / 10;
+    
+    char hzStr[12];
+    if (freqHz < 100) {
+      sprintf(hzStr, "%d.%dHz", freqHz, freqDec);
     } else {
-      dtostrf(smoothedFrequency, 4, 0, hzStr);
+      sprintf(hzStr, "%dHz", freqHz);
     }
-    strcat(hzStr, "Hz");
     int hzWidth = strlen(hzStr) * 6;
     int hzX = (128 - hzWidth) / 2;
     display.setCursor(hzX, yOff + 24);
     display.print(hzStr);
     
-    // Method indicator
-    display.setCursor(116, yOff + 24);
-    if (tunerDetectionMethod == 1) display.print('Z');
-    else if (tunerDetectionMethod == 2) display.print('Y');
+    // Tuning bar (moved up to make room for waveform)
+    int barY = showParams ? 44 : 34;
     
-    // Tuning bar
-    int barY = showParams ? 54 : 44;
+    // Draw bar
     display.drawRect(14, barY, 100, 6, WHITE);
     display.drawFastVLine(64, barY - 2, 10, WHITE);
     
+    // Draw tuning indicator
     int indicator = 64 + constrain(cents, -50, 50);
     display.fillRect(indicator - 2, barY + 1, 5, 4, WHITE);
+    
+    // Draw waveform below bar (full width, reuse ADC buffer)
+    int waveY = barY + 8;  // 2 pixel gap below bar
+    uint8_t waveH = showParams ? 10 : 14;  // Height available
+    
+    // Find min/max for scaling (use first 128 samples)
+    uint8_t wMin = 255, wMax = 0;
+    for (uint8_t i = 0; i < 128; i++) {
+      if (buffer.raw[i] < wMin) wMin = buffer.raw[i];
+      if (buffer.raw[i] > wMax) wMax = buffer.raw[i];
+    }
+    uint8_t wRange = wMax - wMin;
+    if (wRange < 10) wRange = 10;  // Minimum range
+    
+    // Draw waveform as connected lines (128 pixels, 1:1 mapping)
+    for (uint8_t i = 0; i < 127; i++) {
+      uint8_t y1 = waveH - 1 - (((uint16_t)(buffer.raw[i] - wMin) * (waveH - 1)) / wRange);
+      uint8_t y2 = waveH - 1 - (((uint16_t)(buffer.raw[i + 1] - wMin) * (waveH - 1)) / wRange);
+      display.drawLine(i, waveY + y1, i + 1, waveY + y2, WHITE);
+    }
     
   } else {
     display.setTextSize(2);
@@ -1008,25 +1116,31 @@ void runTunerMode(bool showParams) {
     display.setCursor(34, yOff + 26);
     display.print(F("No signal"));
     
-    int barY = showParams ? 48 : 44;
+    // Tuning bar
+    int barY = showParams ? 44 : 34;
     display.drawRect(14, barY, 100, 6, WHITE);
     display.drawFastVLine(64, barY - 2, 10, WHITE);
+    
+    // Draw waveform below bar (full width, shows noise/input activity)
+    int waveY = barY + 8;
+    uint8_t waveH = showParams ? 10 : 14;
+    
+    // Find min/max for scaling (use first 128 samples)
+    uint8_t wMin = 255, wMax = 0;
+    for (uint8_t i = 0; i < 128; i++) {
+      if (buffer.raw[i] < wMin) wMin = buffer.raw[i];
+      if (buffer.raw[i] > wMax) wMax = buffer.raw[i];
+    }
+    uint8_t wRange = wMax - wMin;
+    if (wRange < 10) wRange = 10;
+    
+    // Draw waveform (128 pixels, 1:1 mapping)
+    for (uint8_t i = 0; i < 127; i++) {
+      uint8_t y1 = waveH - 1 - (((uint16_t)(buffer.raw[i] - wMin) * (waveH - 1)) / wRange);
+      uint8_t y2 = waveH - 1 - (((uint16_t)(buffer.raw[i + 1] - wMin) * (waveH - 1)) / wRange);
+      display.drawLine(i, waveY + y1, i + 1, waveY + y2, WHITE);
+    }
   }
-  
-  // Debug info
-  /*
-  display.setTextSize(1);
-  int debugY = showParams ? 54 : 52;
-  display.setCursor(0, debugY);
-  display.print(dbgMin);
-  display.print('-');
-  display.print(dbgMax);
-  display.print(F(" X:"));
-  display.print(dbgCrossings);
-  display.print(F(" R:"));
-  display.print((int)(dbgSampleRate/1000));
-  display.print('k');
-  */
   
   display.setTextSize(1);
   if (showParams) drawParameterBar(true);
@@ -1036,49 +1150,69 @@ void runTunerMode(bool showParams) {
 void drawParameterBar(bool showParams) {
   if (!showParams) return;
   display.setTextSize(1);
-  //display.drawLine((param - 1) * 42, 8, (param - 1) * 42 + 36, 8, WHITE);
 
+  // Wave mode has 4 menu items, others have 3
+  bool isWaveMode = (mode == MODE_WAVE);
+
+  // Mode name - inverted if selected, underline if cursor here
   display.setTextColor((param_select == 1) ? BLACK : WHITE, (param_select == 1) ? WHITE : BLACK);
   display.setCursor(0, 0);
   switch (mode) {
     case MODE_LFO:      display.print(F("LFO")); break;
     case MODE_WAVE:     display.print(F("WAVE")); break;
-    case MODE_SHOT:     display.print(F("SHOT")); break;
     case MODE_SPECTRUM: display.print(F("SPEC")); break;
     case MODE_TUNER:    display.print(F("TUNE")); break;
   }
+  if (param == 1) display.drawFastHLine(0, 8, 24, WHITE);
 
+  // Param1 (Time/AUTO/High) - inverted if selected, underline if cursor here
   display.setTextColor((param_select == 2) ? BLACK : WHITE, (param_select == 2) ? WHITE : BLACK);
-  display.setCursor(42, 0);
-  switch (mode) {
-    case MODE_LFO:
-    case MODE_WAVE:
-    case MODE_SHOT:    display.print(F("Time:")); break;
-    case MODE_SPECTRUM:display.print(F("High:")); break;
-    case MODE_TUNER:
-      switch (tunerMode) {
-        case 1: display.print(F("ZC")); break;
-        case 2: display.print(F("YIN")); break;
-        case 3: display.print(F("AUTO")); break;
-      }
-      break;
-  }
-  if (mode != MODE_TUNER) {
-    display.setCursor(72, 0); display.print(param1);
+  if (isWaveMode) {
+    display.setCursor(32, 0);
+    if (param1 == 9) {
+      display.print(F("AUTO"));
+    } else {
+      display.print(F("T:"));
+      display.print(param1);
+    }
+    if (param == 2) display.drawFastHLine(32, 8, 24, WHITE);
+  } else {
+    display.setCursor(42, 0);
+    switch (mode) {
+      case MODE_LFO:       display.print(F("Time:")); break;
+      case MODE_SPECTRUM:  display.print(F("High:")); break;
+      case MODE_TUNER:     display.print(F("ZC")); break;  // ZC-only mode
+    }
+    if (mode != MODE_TUNER) {
+      display.setCursor(72, 0); display.print(param1);
+    }
+    if (param == 2) display.drawFastHLine(42, 8, 36, WHITE);
   }
 
-  if (mode == MODE_SHOT) {
-    display.setTextColor(trig ? BLACK : WHITE, trig ? WHITE : BLACK);
-    display.setCursor(84, 0); display.print(F("TRIG"));
+  // Param2 / Param3 area
+  if (isWaveMode) {
+    // Wave mode: Offs (param2) then Rfrs (param3)
+    display.setTextColor((param_select == 3) ? BLACK : WHITE, (param_select == 3) ? WHITE : BLACK);
+    display.setCursor(60, 0);
+    display.print(F("O:"));
+    display.print(param2);
+    if (param == 3) display.drawFastHLine(60, 8, 24, WHITE);
+    
+    display.setTextColor((param_select == 4) ? BLACK : WHITE, (param_select == 4) ? WHITE : BLACK);
+    display.setCursor(90, 0);
+    display.print(F("R:"));
+    display.print(param3);
+    if (param == 4) display.drawFastHLine(90, 8, 24, WHITE);
   } else if (mode != MODE_TUNER) {
+    // LFO: Offs, Spectrum: Filt
     display.setTextColor((param_select == 3) ? BLACK : WHITE, (param_select == 3) ? WHITE : BLACK);
     display.setCursor(84, 0);
     switch (mode) {
-      case MODE_LFO:     display.print(F("Offs:")); break;
-      case MODE_WAVE:    display.print(F("Rfrs:")); break;
+      case MODE_LFO:      display.print(F("Offs:")); break;
       case MODE_SPECTRUM:display.print(F("Filt:")); break;
     }
     display.setCursor(114, 0); display.print(param2);
+    if (param == 3) display.drawFastHLine(84, 8, 36, WHITE);
   }
 }
 
@@ -1114,7 +1248,7 @@ void configMenu() {
     EEPROM.put(MENUTIMER_DIR_ADDR, (uint8_t)menuTimer);
     EEPROM.write(BOOTLOGO_ADDR, bootLogoEnabled);
     
-    saveCurrentModeToRAM();
+    saveCurrentModeToRAM(mode);
     saveAllSettings();
 
     display.clearDisplay();
