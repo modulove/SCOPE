@@ -6,10 +6,10 @@
  * @date 2026-01-07
  * 
  * BACKPORTED IMPROVEMENTS FROM v2:
- * - fastAnalogRead()  for LFO/Wave/Shot modes
- * - TUNER MODE more accuracy and reliability:
- * - Enhanced tuner with waveform visualization below tuning bar
- * - Added navigation rollover 
+ * - fastAnalogRead() with prescaler 32 (~13µs) for LFO/Wave/Shot modes
+ * - Waveform visualization below tuning bar
+ * - Settings management
+ * - Navigation rollover for all parameters
  * - Config menu with 2s hold-to-save
  * 
  * HARDWARE: Arduino Nano + SSD1306 OLED (unipolar input 0-5V only)
@@ -252,7 +252,7 @@ uint32_t detectFrequencyZC(uint16_t sampleRateX10) {
   uint32_t freqX100 = ((uint32_t)sampleRateX10 * 1000UL * (crossings - 1)) / totalSamples;
   
   // Sanity check: reject obviously wrong frequencies
-  if (freqX100 < 1000 || freqX100 > 800000) return 0;  // 10Hz - 8kHz range
+  if (freqX100 < 800 || freqX100 > 800000) return 0;  // 8Hz - 8kHz range
   
   return freqX100;
 }
@@ -410,8 +410,39 @@ void loop() {
   newPosition = encoderDirection * encoder.read();
 
   // Button: cycle through parameter "slots"
-  if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
-  else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
+  // BUT: if we just saved (hasSaved=true), don't allow mode/param changes until button is released
+  if (!hasSaved) {
+    if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
+    else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
+  }
+
+  // Show save confirmation and block mode switches
+  static unsigned long saveDisplayTime = 0;
+  if (hasSaved && SW) {
+    // Button still held after save - show save confirmation
+    if (saveDisplayTime == 0) saveDisplayTime = millis();
+    
+    if (millis() - saveDisplayTime < 600) {
+      display.clearDisplay();
+      display.setTextColor(WHITE);
+      display.setTextSize(1);
+      display.setCursor(8, 28);
+      display.print(F("MODE "));
+      display.print(mode);
+      display.print(F(" SAVED!"));
+      display.display();
+      return;  // Skip rest of loop while showing save message
+    }
+  }
+  
+  // Reset save display timer when button released
+  if (!SW && saveDisplayTime > 0) {
+    saveDisplayTime = 0;
+    hasSaved = false;  // Allow normal operation again
+  }
+
+  // Don't allow encoder changes while button is held (after save)
+  if (hasSaved && SW) return;
 
   newPosition = encoderDirection * encoder.read();
   if ((newPosition - 3) / 4 > oldPosition / 4) {
@@ -769,15 +800,13 @@ void runTunerMode(bool showParams) {
   static unsigned long lastMeasurement = 0;
   static unsigned long lastDisplay = 0;
   
-  // Collect samples for frequency detection (every 50ms)
-  if (millis() - lastMeasurement >= 50) {
+  // Collect samples for frequency detection (every 80ms to allow more settling time)
+  if (millis() - lastMeasurement >= 80) {
     lastMeasurement = millis();
     
-    // Sample 256 points with prescaler 64 for better low-frequency response
-    // Prescaler 64: 16MHz/64 = 250kHz ADC clock
-    // 13 cycles per conversion = 52µs
-    // Add 10µs delay for stable ~16kHz sample rate
-    // This gives us 16ms of data, good for detecting down to 60Hz (2 periods)
+    // For LOW frequencies, we need MORE TIME to capture complete periods
+    // Sample 256 points with prescaler 64 + longer delays
+    // Goal: capture 40ms of data for reliable 50-60Hz detection
     
     noInterrupts();
     ADMUX = (1 << REFS0) | (1 << ADLAR) | (ANALOG_INPUT_PIN & 0x07);
@@ -785,14 +814,22 @@ void runTunerMode(bool showParams) {
       ADCSRA = (1 << ADEN) | (1 << ADSC) | (0x06);  // Start conversion, prescaler 64
       while (ADCSRA & (1 << ADSC));  // Wait for completion (~52µs)
       buffer.waveform[i] = ADCH;
-      delayMicroseconds(10);  // Total ~62µs per sample = 16.1kHz sample rate
+      delayMicroseconds(105);  // Total ~157µs per sample = 6.37kHz sample rate
     }
     interrupts();
     
-    // Sample rate: ~16,129 Hz, so sampleRateX10 = 1613
-    uint32_t rawFreqX100 = detectFrequencyZC(1613);
+    // Sample 256 points at 157µs each = 40.2ms total capture time
+    // This gives us:
+    // - 50Hz (20ms period): 2.01 periods (GOOD!)
+    // - 60Hz (16.7ms period): 2.41 periods (EXCELLENT!)
+    // - 82Hz (12.2ms period): 3.3 periods (EXCELLENT!)
+    // Theoretical sample rate: 6,369 Hz
+    // Calibrated with 440Hz reference (old code was 3.2% high)
+    // Corrected: 6369 / 1.032 = 6,172 Hz
+    // sampleRateX10 = 617
+    uint32_t rawFreqX100 = detectFrequencyZC(617);
     
-    if (rawFreqX100 > 2000 && rawFreqX100 < 500000) {  // 20-5000 Hz
+    if (rawFreqX100 > 1500 && rawFreqX100 < 500000) {  // 15-5000 Hz
       lastValidFreqX100 = rawFreqX100;
       
       // Smoothing based on param1
@@ -821,19 +858,19 @@ void runTunerMode(bool showParams) {
     } else {
       // Decay smoothed value when no signal
       smoothedFreqX100 = (smoothedFreqX100 * 85) / 100;
-      if (smoothedFreqX100 < 2000) smoothedFreqX100 = 0;
+      if (smoothedFreqX100 < 1500) smoothedFreqX100 = 0;
     }
   }
 
-  // Update display (every 120ms for stability)
-  if (millis() - lastDisplay < 120) return;
+  // Update display (every 150ms for stability with slower sampling)
+  if (millis() - lastDisplay < 150) return;
   lastDisplay = millis();
   
   display.clearDisplay();
   
   int yOff = showParams ? 10 : 0;
   
-  if (smoothedFreqX100 > 2000) {
+  if (smoothedFreqX100 > 1500) {
     char note[3];
     int8_t octave, cents;
     frequencyToNote(smoothedFreqX100, note, &octave, &cents);
