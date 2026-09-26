@@ -2,7 +2,7 @@
  * @file SCOPEv2.ino
  * @author Modulove
  * @brief Eurorack scope + Tuner + Function Generator
- * @version 3.7
+ * @version 3.9
  * @date 2025-02-15
  *
  * Modes: LFO / WAVE / TUNER / GEN (4 modes)
@@ -14,6 +14,16 @@
  * v3.7: zero-dead-time capture: the ISR re-arms itself after every sweep
  *       (ping-pong halves of buffer[]), so no trigger edge is ever missed;
  *       an external edge always re-locks the sweep; R: is display rate only.
+ * v3.8: hardware profile override. The v2/v2.5 ident pin (A7) is floating on
+ *       some boards, so autodetection could pick the wrong display pins and
+ *       leave the screen dark. Hold the encoder button while powering up to
+ *       step through the profiles; the choice is stored in EEPROM.
+ *       Profile bit0 = v2.5 display wiring, bit1 = v2.5 encoder wiring.
+ * v3.9: RAM fix. v3.7 added a 128 byte sweep copy, which left too little heap
+ *       for the SSD1306 1KB framebuffer: begin() could fail and the screen
+ *       stayed dark. The finished sweep is now displayed in place - the two
+ *       halves of buffer[] are owned by the ISR and the main loop in turn -
+ *       so there is still no copy, no tearing and no capture dead time.
  *
  * MODE_LFO: Continuous scrolling waveform. Trigger pin freezes a single capture.
  * MODE_WAVE: Triggered sweep, ISR-sampled. Cable in TRIGGER -> external edge
@@ -61,7 +71,9 @@
 #define V25_OLED_CLK   13
 
 Adafruit_SSD1306 *display = nullptr;
-bool isHWv25 = false;
+bool isHWv25 = false;   // v2.5 display + DAC wiring
+bool encV25 = false;    // v2.5 encoder wiring (A2/A3 instead of D2/D4)
+uint8_t hwProfile = 0xFF;
 
 // ================== Pins ==================
 #define V2_ENCODER_PIN_A   2
@@ -87,6 +99,7 @@ Encoder *encoder = nullptr;
 #define EEPROM_PARAM_SELECT_ADDR  6   // 4 modes x 3 bytes = 12 bytes (6..17)
 #define EEPROM_CAL_OFFSET_ADDR   18  // int8_t
 #define EEPROM_CAL_GAIN_ADDR     19  // uint8_t (128=1.00x)
+#define EEPROM_HWPROFILE_ADDR    20  // 0..3 = forced profile, anything else = autodetect
 
 #define EEPROM_MAGIC_VALUE  0xA9
 
@@ -125,7 +138,7 @@ volatile bool     capReady = false;         // a sweep completed since the last 
 volatile bool     capRearm = false;         // ISR re-arms itself after each sweep (WAVE)
 volatile uint8_t  capBase = 0, readyBase = 0;   // ping-pong halves of buffer[] (WAVE)
 uint8_t           trigPinLast = 0;          // ISR-only
-uint8_t           disp[128];                // main-loop copy of the last complete sweep
+volatile uint8_t  drawBase = 128;           // half of buffer[] owned by the main loop
 
 // WAVE time base: ADC decimation per step, T:1 slowest .. T:8 fastest
 // sweep length on LGT8F ~ 364, 182, 91, 45, 23, 11, 5.7, 2.8 ms
@@ -194,16 +207,6 @@ const uint16_t noteFreqO4x10[] PROGMEM = {
 const char noteNames[] PROGMEM = "C C#D D#E F F#G G#A A#B ";
 
 // (Boot logo animation removed for flash savings)
-
-// Format voltage × 100 as "X.XX" (integer math, no float)
-void fmtDec2(char* buf, uint16_t vx100) {
-  char* p = fmtInt(buf, vx100 / 100);
-  *p++ = '.';
-  uint8_t frac = vx100 % 100;
-  *p++ = '0' + frac / 10;
-  *p++ = '0' + frac % 10;
-  *p++ = '\0';
-}
 
 // ================== Shared Buffer ==================
 uint8_t buffer[ADC_BUFFER_SIZE];
@@ -373,8 +376,10 @@ ISR(ADC_vect) {
       if (adcSampleIndex >= adcTargetSamples) {
         readyBase = capBase;
         capReady = true;
-        if (capRearm) {   // WAVE: swap halves and wait for the next trigger at once
-          capBase ^= 128; adcSampleIndex = 0; trigArmed = false; capState = CAP_ARMED;
+        if (capRearm) {   // WAVE: re-arm at once, but never overwrite the displayed half
+          uint8_t next = capBase ^ 128;
+          if (next != drawBase) capBase = next;
+          adcSampleIndex = 0; trigArmed = false; capState = CAP_ARMED;
         } else capState = CAP_DONE;
       }
       break;
@@ -394,6 +399,7 @@ void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip,
   capReady = false;
   capRearm = rearm;
   capBase = 0;
+  drawBase = 128;
   capSrc = src;
   capState = CAP_ARMED;
   ADMUX = (1 << REFS0) | (1 << ADLAR) | (ANALOG_INPUT_PIN & 0x07);
@@ -529,11 +535,31 @@ void detectHardware() {
   #else
     isLGT8F = false;
   #endif
-  isHWv25 = (analogRead(IDENT_HW_PIN) < 100);
+  // Hardware profile. The ident pin is not connected on every board revision,
+  // and a floating analog pin reads differently per chip and per power-up, so
+  // the stored profile wins when set. Holding the encoder button during power
+  // up steps to the next profile and stores it - the only way to recover when
+  // the wrong display pins leave the screen dark.
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  delayMicroseconds(200);                  // let the pull-up settle
+  hwProfile = EEPROM.read(EEPROM_HWPROFILE_ADDR);
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    delay(600);                            // ignore a brushed encoder
+    if (digitalRead(BUTTON_PIN) == LOW) {
+      hwProfile = (hwProfile > 3) ? 3 : ((hwProfile + 1) & 3);
+      EEPROM.update(EEPROM_HWPROFILE_ADDR, hwProfile);
+    }
+  }
+  if (hwProfile <= 3) {
+    isHWv25 = hwProfile & 1;
+    encV25  = (hwProfile & 2) != 0;
+  } else {
+    isHWv25 = encV25 = (analogRead(IDENT_HW_PIN) < 100);
+  }
 
   // Determine DAC availability
   #if IS_LGT8F
-    genAvailable = isHWv25;  // Native DAC on D4 (v2.5 only)
+    genAvailable = isHWv25 && encV25;  // native DAC on D4, which is ENC_B on mixed wiring
   #else
     if (isHWv25) {
       // ATmega328P on v2.5: scan for MCP4725 I2C DAC
@@ -548,8 +574,8 @@ void detectHardware() {
     }
   #endif
 
-  encoder = isHWv25 ? new Encoder(V25_ENCODER_PIN_A, V25_ENCODER_PIN_B)
-                     : new Encoder(V2_ENCODER_PIN_A, V2_ENCODER_PIN_B);
+  encoder = encV25 ? new Encoder(V25_ENCODER_PIN_A, V25_ENCODER_PIN_B)
+                   : new Encoder(V2_ENCODER_PIN_A, V2_ENCODER_PIN_B);
 }
 
 void initDisplay() {
@@ -707,10 +733,11 @@ void setup() {
   display->print(F("SCOPE"));
   display->setTextSize(1);
   display->setCursor(16, 32);
-  display->print(F("Modulove v3.7"));
+  display->print(F("Modulove v3.9"));
   display->setCursor(0, 56);
   display->print(isHWv25 ? F("v2.5") : F("v2"));
   display->print(isLGT8F ? F(" LGT") : F(" 328"));
+  if (hwProfile <= 3) { display->print(F(" P")); display->print(hwProfile); }
   if (genAvailable) display->print(dacIsI2C ? F(" I2C") : F(" DAC"));
   display->display();
   delay(800);
@@ -917,9 +944,10 @@ void runLFOMode(bool showParams) {
 #define SWEEP_TIMEOUT_MS  600UL    // longest sweep is ~430 ms: longer in CAP_RUN = stalled, re-arm
 
 void drawWave(bool showParams) {
+  const uint8_t* b = buffer + drawBase;
   display->clearDisplay();
   for (uint8_t i = 1; i < 128; i++)
-    display->drawLine(i - 1, disp[i - 1] >> 2, i, disp[i] >> 2, WHITE);
+    display->drawLine(i - 1, b[i - 1] >> 2, i, b[i] >> 2, WHITE);
   if (showParams) drawParameterBar(true);
 }
 
@@ -956,11 +984,18 @@ void runWaveMode(bool showParams) {
 
   // Finished sweep -> display copy (ISR is already filling the other half)
   if (capReady) {
+    cli();
     capReady = false;
-    memcpy(disp, buffer + readyBase, 128);
+    uint8_t freed = drawBase;
+    drawBase = readyBase;          // display the finished sweep where it was captured
+    if (capBase == drawBase) {     // ISR was refilling it - send it to the freed half
+      capBase = freed; adcSampleIndex = 0; trigArmed = false; capState = CAP_ARMED;
+    }
+    sei();
     haveNew = true; lastSweep = now;
     uint8_t mn = 255, mx = 0;
-    for (uint8_t i = 0; i < 128; i++) { uint8_t v = disp[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    const uint8_t* b = buffer + drawBase;
+    for (uint8_t i = 0; i < 128; i++) { uint8_t v = b[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
     uint8_t range = mx - mn;
     softOK = (range >= 8);
     if (softOK) {
@@ -1085,18 +1120,7 @@ void runGeneratorMode(bool showParams) {
   static unsigned long lastDraw = 0;
   static unsigned long lastSample = 0;
 
-  if (!genAvailable) {
-    if (millis() - lastDraw >= 200) {
-      lastDraw = millis();
-      display->clearDisplay();
-      display->setTextSize(1);
-      display->setCursor(10, 24);
-      display->print(F("GEN needs v2.5"));
-      if (showParams) drawParameterBar(true);
-      display->display();
-    }
-    return;
-  }
+  if (!genAvailable) return;   // mode selection never lands here without a DAC
 
   // Recalculate phase inc
   if (param1 != 5) {
