@@ -2,13 +2,23 @@
  * @file SCOPEv2.ino
  * @author Modulove
  * @brief Eurorack scope + Tuner + Function Generator
- * @version 3.4
+ * @version 3.7
  * @date 2025-02-15
  *
  * Modes: LFO / WAVE / TUNER / GEN (4 modes)
  *
+ * v3.5: parameter bar underlines the slot under the cursor while browsing;
+ *       the slot being edited stays inverted.
+ * v3.6: WAVE mode gets a real trigger engine (external + software + auto),
+ *       monotonic time base T:1 (slowest) .. T:8 (fastest), left-to-right sweep.
+ * v3.7: zero-dead-time capture: the ISR re-arms itself after every sweep
+ *       (ping-pong halves of buffer[]), so no trigger edge is ever missed;
+ *       an external edge always re-locks the sweep; R: is display rate only.
+ *
  * MODE_LFO: Continuous scrolling waveform. Trigger pin freezes a single capture.
- * MODE_WAVE: Fast triggered waveform with ISR-based ADC sampling.
+ * MODE_WAVE: Triggered sweep, ISR-sampled. Cable in TRIGGER -> external edge
+ *   trigger (last sweep held until the next edge). Otherwise software trigger
+ *   on the signal's mid-level; free-runs after 100 ms without a crossing (auto).
  * MODE_TUNER: Frequency detection (ZC) with auto sample rate + waveform preview.
  * MODE_GEN: Function generator (v2.5 only).
  *   - LGT8F: Native DAC on D4 (50kHz sample rate)
@@ -87,15 +97,39 @@ Encoder *encoder = nullptr;
 #define MODE_GEN    4
 #define NUM_MODES   4
 
-// ================== ADC ==================
+// ================== ADC / Capture Engine ==================
 #define ADC_BUFFER_SIZE 256
+#define ADC_PS_WAVE     0x05   // prescaler 32: ~45 kSPS on LGT8F, ~38 kSPS on ATmega328P
 
+// Capture states (advanced by the ADC ISR)
+#define CAP_IDLE   0
+#define CAP_ARMED  1   // waiting for trigger
+#define CAP_RUN    2   // storing samples
+#define CAP_DONE   3   // buffer complete
+
+// Trigger sources
+#define TRIG_NONE  0   // free-run (auto)
+#define TRIG_SOFT  1   // level trigger on the signal itself
+#define TRIG_EXT   2   // rising edge on TRIGGER_PIN
+
+volatile uint8_t  capState = CAP_IDLE;
+volatile uint8_t  capSrc = TRIG_NONE;
 volatile uint16_t adcSampleIndex = 0;
 volatile uint16_t adcTargetSamples = 128;
-volatile bool     adcBufferReady = false;
-volatile bool     adcSampling = false;
 volatile uint8_t  adcDelayCounter = 0;
 volatile uint8_t  adcDelayTarget = 0;
+volatile uint8_t  trigLo = 0, trigHi = 0;   // software trigger window (ADC units)
+volatile bool     trigArmed = false;        // signal seen on the far side of the window
+volatile bool     extEdge = false;          // rising edge seen on TRIGGER_PIN
+volatile bool     capReady = false;         // a sweep completed since the last copy
+volatile bool     capRearm = false;         // ISR re-arms itself after each sweep (WAVE)
+volatile uint8_t  capBase = 0, readyBase = 0;   // ping-pong halves of buffer[] (WAVE)
+uint8_t           trigPinLast = 0;          // ISR-only
+uint8_t           disp[128];                // main-loop copy of the last complete sweep
+
+// WAVE time base: ADC decimation per step, T:1 slowest .. T:8 fastest
+// sweep length on LGT8F ~ 364, 182, 91, 45, 23, 11, 5.7, 2.8 ms
+const uint8_t waveSkip[8] PROGMEM = {127, 63, 31, 15, 7, 3, 1, 0};
 
 // ================== Tuner state ==================
 float   smoothedFrequency = 0;
@@ -293,7 +327,8 @@ void saveCurrentModeToRAM();
 void saveAllSettings();
 void loadAllSettings();
 void resetEEPROMDefaults();
-void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip);
+void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip, uint8_t src, bool rearm);
+void drawWave(bool showParams);
 void stopADCSampling();
 uint8_t fastAnalogRead();
 float detectFrequencyZC();
@@ -306,28 +341,61 @@ uint8_t generateSample(uint8_t waveform, uint8_t idx);
 uint32_t calcPhaseInc(uint8_t freqIdx, uint32_t sr);
 
 // ================== ADC Interrupt ==================
+// The ADC free-runs. The trigger is evaluated on EVERY conversion (sub-pixel
+// trigger precision at slow time bases); samples are stored decimated once
+// running. The analog front-end is inverting (U3A), so a rising input edge
+// is a FALLING ADC value.
 ISR(ADC_vect) {
-  if (!adcSampling) return;
-  if (adcDelayCounter < adcDelayTarget) { adcDelayCounter++; return; }
-  adcDelayCounter = 0;
-  if (adcSampleIndex < adcTargetSamples) {
-    buffer[adcSampleIndex++] = ADCH;
-    if (adcSampleIndex >= adcTargetSamples) {
-      adcBufferReady = true;
-      adcSampling = false;
-      ADCSRA &= ~((1 << ADATE) | (1 << ADIE));
-    }
+  uint8_t s = ADCH;
+  uint8_t pin = PIND & _BV(7);              // TRIGGER_PIN D7 (100k pull-down)
+  bool rise = pin && !trigPinLast;
+  trigPinLast = pin;
+  if (rise) extEdge = true;
+
+  switch (capState) {
+    case CAP_ARMED:
+      // An external edge is always a valid trigger point. Otherwise apply the
+      // software level (falling ADC = rising input), or free-run (TRIG_NONE).
+      if (!rise) {
+        if (capSrc == TRIG_EXT) return;
+        if (capSrc == TRIG_SOFT) {
+          if (s >= trigHi) { trigArmed = true; return; }   // input below level
+          if (!(trigArmed && s <= trigLo)) return;          // wait for the crossing
+        }
+      }
+      capState = CAP_RUN;
+      adcDelayCounter = 0;
+      // fall through: the triggering conversion is the first stored sample
+    case CAP_RUN:
+      if (adcDelayCounter) { adcDelayCounter--; return; }
+      adcDelayCounter = adcDelayTarget;
+      buffer[capBase + adcSampleIndex++] = s;
+      if (adcSampleIndex >= adcTargetSamples) {
+        readyBase = capBase;
+        capReady = true;
+        if (capRearm) {   // WAVE: swap halves and wait for the next trigger at once
+          capBase ^= 128; adcSampleIndex = 0; trigArmed = false; capState = CAP_ARMED;
+        } else capState = CAP_DONE;
+      }
+      break;
+    default: break;
   }
 }
 
-void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip) {
+// Arm a capture. src = TRIG_NONE starts on the next conversion. With rearm the
+// ISR alternates between buffer[0..127] and buffer[128..255] and never idles.
+// The ADC keeps free-running after CAP_DONE so TRIGGER_PIN edges are still seen.
+void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip, uint8_t src, bool rearm) {
   cli();
   adcSampleIndex = 0;
   adcTargetSamples = min(numSamples, (uint16_t)ADC_BUFFER_SIZE);
-  adcBufferReady = false;
-  adcSampling = true;
-  adcDelayCounter = 0;
   adcDelayTarget = delaySkip;
+  trigArmed = false;
+  capReady = false;
+  capRearm = rearm;
+  capBase = 0;
+  capSrc = src;
+  capState = CAP_ARMED;
   ADMUX = (1 << REFS0) | (1 << ADLAR) | (ANALOG_INPUT_PIN & 0x07);
   ADCSRA = (1 << ADEN) | (1 << ADSC) | (1 << ADATE) | (1 << ADIE) | (prescaler & 0x07);
   ADCSRB = 0;
@@ -336,7 +404,7 @@ void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip)
 
 void stopADCSampling() {
   ADCSRA &= ~((1 << ADIE) | (1 << ADATE));
-  adcSampling = false;
+  capState = CAP_IDLE;
 }
 
 uint8_t fastAnalogRead() {
@@ -639,7 +707,7 @@ void setup() {
   display->print(F("SCOPE"));
   display->setTextSize(1);
   display->setCursor(16, 32);
-  display->print(F("Modulove v3.4"));
+  display->print(F("Modulove v3.7"));
   display->setCursor(0, 56);
   display->print(isHWv25 ? F("v2.5") : F("v2"));
   display->print(isLGT8F ? F(" LGT") : F(" 328"));
@@ -763,6 +831,7 @@ void setupMode(uint8_t m) {
     case MODE_WAVE:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
+      extEdge = false;
       break;
     case MODE_TUNER:
       analogWrite(OFFSET_PIN, 127);
@@ -835,36 +904,83 @@ void runLFOMode(bool showParams) {
 }
 
 // ================== Wave Mode ==================
+// Triggered sweep, drawn left to right from the trigger point. The ISR captures
+// continuously (see ISR); this function only picks the trigger source, copies
+// finished sweeps and draws them at most every R: ms.
+//   TRIGGER jack patched -> every rising edge on TRIGGER_PIN starts a sweep;
+//                           the last sweep is held while no edge arrives
+//   otherwise            -> software trigger at the mid-level of the last sweep
+//                           (rising input); after AUTO_TRIG_WAIT_MS without a
+//                           crossing one sweep free-runs (auto)
+#define EXT_TRIG_HOLD_MS  10000UL  // external trigger counts as present this long after an edge
+#define AUTO_TRIG_WAIT_MS 100UL
+#define SWEEP_TIMEOUT_MS  600UL    // longest sweep is ~430 ms: longer in CAP_RUN = stalled, re-arm
+
+void drawWave(bool showParams) {
+  display->clearDisplay();
+  for (uint8_t i = 1; i < 128; i++)
+    display->drawLine(i - 1, disp[i - 1] >> 2, i, disp[i] >> 2, WHITE);
+  if (showParams) drawParameterBar(true);
+}
+
 void runWaveMode(bool showParams) {
   param  = constrain(param, 1, 3);
   param1 = constrain(param1, 1, 8);
   param2 = constrain(param2, 1, 6);
 
-  static unsigned long lastUp = 0, stateStart = 0;
+  static unsigned long lastDraw = 0, lastSweep = 0, runSince = 0;
+  static unsigned long lastExtEdge = (unsigned long)0 - EXT_TRIG_HOLD_MS;   // stale at boot
+  static uint16_t lastUI = 0xFFFF;
+  static bool haveNew = false, softOK = false;
   unsigned long interval = 20UL + (param2 - 1) * 10UL;
+  unsigned long now = millis();
 
-  switch (waveState) {
-    case 0:
-      if (millis() - lastUp >= interval) {
-        uint8_t ps, ds;
-        if (param1 <= 5) { ps = 0x05; ds = (6 - param1) * 2; }
-        else { ps = 0x06; ds = (param1 - 5) * 4; }
-        startADCSampling(128, ps, ds);
-        waveState = 1; stateStart = millis();
-      } break;
-    case 1:
-      if (adcBufferReady) { lastUp = millis(); waveState = 2; }
-      else if (millis() - stateStart > 100) { stopADCSampling(); waveState = 0; }  // timeout — retry
-      break;
-    case 2:
-      display->clearDisplay();
-      for (uint8_t i = 0; i < 128; i++) buffer[i] >>= 2;
-      for (int i = 1; i < 127; i++)
-        display->drawLine(127 - i, buffer[i - 1], 127 - (i + 1), buffer[i], WHITE);
-      if (showParams) drawParameterBar(true);
-      waveState = 0;
-      break;
+  if (extEdge) { extEdge = false; lastExtEdge = now; }
+  bool extActive = (now - lastExtEdge < EXT_TRIG_HOLD_MS) || digitalRead(TRIGGER_PIN);
+
+  // Menu/param change: time base -> restart capture; anything else -> redraw
+  // the held sweep at once so navigation never waits for the next trigger
+  uint16_t ui = (showParams ? 0x8000 : 0) | ((uint16_t)param_select << 12) | ((uint16_t)param << 8)
+              | ((uint16_t)param1 << 4) | (param2 & 0x0F);
+  if (ui != lastUI) {
+    bool timebaseChanged = ((ui ^ lastUI) & 0x00F0) != 0;
+    lastUI = ui;
+    if (timebaseChanged) { stopADCSampling(); waveState = 0; }
+    else drawWave(showParams);
   }
+
+  if (waveState == 0) {   // (re)start: first sweep free-runs to learn the signal level
+    startADCSampling(128, ADC_PS_WAVE, pgm_read_byte(&waveSkip[param1 - 1]), extActive ? TRIG_EXT : TRIG_NONE, true);
+    lastSweep = runSince = now; waveState = 1; softOK = false;
+  }
+
+  // Finished sweep -> display copy (ISR is already filling the other half)
+  if (capReady) {
+    capReady = false;
+    memcpy(disp, buffer + readyBase, 128);
+    haveNew = true; lastSweep = now;
+    uint8_t mn = 255, mx = 0;
+    for (uint8_t i = 0; i < 128; i++) { uint8_t v = disp[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
+    uint8_t range = mx - mn;
+    softOK = (range >= 8);
+    if (softOK) {
+      uint8_t hyst = range >> 3; if (hyst < 3) hyst = 3;
+      uint8_t mid = mn + (range >> 1);
+      trigLo = mid - hyst; trigHi = mid + hyst;
+    }
+  }
+
+  // Trigger source for the sweep the ISR is waiting on
+  if (capState == CAP_ARMED) {
+    runSince = now;
+    if (extActive) capSrc = TRIG_EXT;
+    else if (now - lastSweep > AUTO_TRIG_WAIT_MS) capSrc = TRIG_NONE;   // auto: free-run this sweep
+    else capSrc = softOK ? TRIG_SOFT : TRIG_NONE;
+  } else if (capState == CAP_RUN && now - runSince > SWEEP_TIMEOUT_MS) {
+    stopADCSampling(); waveState = 0;                                    // safety: ADC stalled
+  }
+
+  if (haveNew && now - lastDraw >= interval) { lastDraw = now; haveNew = false; drawWave(showParams); }
 }
 
 // ================== Tuner (ZC-only, auto sample rate) ==================
@@ -891,10 +1007,10 @@ void runTunerMode(bool showParams) {
           ps = 0x06; ds = 0; tunerSampleRate = 3;
           sampleRateHz = IS_LGT8F ? 22727.0f : 19230.0f;  // LGT8F: 32M/64/22
         }
-        startADCSampling(256, ps, ds); tunerState = 1; stateStart = millis();
+        startADCSampling(256, ps, ds, TRIG_NONE, false); tunerState = 1; stateStart = millis();
       } break;
     case 1:
-      if (adcBufferReady) tunerState = 2;
+      if (capState == CAP_DONE) tunerState = 2;
       else if (millis() - stateStart > 200) { stopADCSampling(); tunerState = 0; }  // timeout — retry
       break;
     case 2: {
@@ -1090,23 +1206,36 @@ void runGeneratorMode(bool showParams) {
 }
 
 // ================== Parameter Bar ==================
+// Navigation feedback:
+//   browsing (param_select == 0) -> slot under the cursor (param) is underlined
+//   editing  (param_select == n) -> slot n is drawn inverted
+void barSlotBegin(uint8_t slot, int16_t x) {
+  bool editing = (param_select == slot);
+  display->setTextColor(editing ? BLACK : WHITE, editing ? WHITE : BLACK);
+  display->setCursor(x, 0);
+}
+
+void barSlotEnd(uint8_t slot, int16_t x) {
+  if (param_select == 0 && param == slot)
+    display->drawFastHLine(x, 8, display->getCursorX() - x - 1, WHITE);
+}
+
 void drawParameterBar(bool showParams) {
   if (!showParams) return;
   display->setTextSize(1);
 
   // Slot 1: Mode
-  display->setTextColor(param_select == 1 ? BLACK : WHITE, param_select == 1 ? WHITE : BLACK);
-  display->setCursor(0, 0);
+  barSlotBegin(1, 0);
   switch (mode) {
     case MODE_LFO:   display->print(F("LFO"));  break;
     case MODE_WAVE:  display->print(F("WAVE")); break;
     case MODE_TUNER: display->print(F("TUNE")); break;
     case MODE_GEN:   display->print(F("GEN"));  break;
   }
+  barSlotEnd(1, 0);
 
   // Slot 2: Param1
-  display->setTextColor(param_select == 2 ? BLACK : WHITE, param_select == 2 ? WHITE : BLACK);
-  display->setCursor(36, 0);
+  barSlotBegin(2, 36);
   switch (mode) {
     case MODE_LFO: case MODE_WAVE:
       display->print(F("T:")); display->print(param1); break;
@@ -1117,11 +1246,11 @@ void drawParameterBar(bool showParams) {
       display->print(w);
     } break;
   }
+  barSlotEnd(2, 36);
 
   // Slot 3: Param2
   if (mode == MODE_GEN) {
-    display->setTextColor(param_select == 3 ? BLACK : WHITE, param_select == 3 ? WHITE : BLACK);
-    display->setCursor(66, 0);
+    barSlotBegin(3, 66);
     if (param1 == 5) {
       char v[6]; fmtDec1(v, param2);
       display->print(v); display->print('V');
@@ -1130,12 +1259,17 @@ void drawParameterBar(bool showParams) {
       char f[10]; fmtFreq(f, fX10);
       display->print(f);
     }
+    barSlotEnd(3, 66);
   } else if (mode != MODE_TUNER) {
-    display->setTextColor(param_select == 3 ? BLACK : WHITE, param_select == 3 ? WHITE : BLACK);
-    display->setCursor(78, 0);
+    barSlotBegin(3, 78);
     display->print(mode == MODE_LFO ? F("O:") : F("R:"));
     display->print(param2);
+    barSlotEnd(3, 78);
   }
+
+  // Restore transparent white text, otherwise the next frame of the mode
+  // screen inherits the inverted colors of an edited slot 3
+  display->setTextColor(WHITE);
 }
 
 // ================== Config Menu ==================
