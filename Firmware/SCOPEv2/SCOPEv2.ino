@@ -2,10 +2,10 @@
  * @file SCOPEv2.ino
  * @author Modulove
  * @brief Eurorack scope + Tuner + Function Generator
- * @version 3.9
+ * @version 4.5
  * @date 2025-02-15
  *
- * Modes: LFO / WAVE / TUNER / GEN (4 modes)
+ * Modes: LFO / WAVE / TUNER / GEN / RND / CLK / REF (7 modes)
  *
  * v3.5: parameter bar underlines the slot under the cursor while browsing;
  *       the slot being edited stays inverted.
@@ -24,6 +24,69 @@
  *       stayed dark. The finished sweep is now displayed in place - the two
  *       halves of buffer[] are owned by the ISR and the main loop in turn -
  *       so there is still no copy, no tearing and no capture dead time.
+ * v3.10: GEN no longer busy-waits. On LGT8F the DAC is fed from a Timer1
+ *        interrupt at the sample rate, so the main loop stays responsive
+ *        (the 4 ms blocking burst used to swallow encoder steps and make
+ *        the module look frozen) and the output has no gaps while drawing.
+ *        Build with -DSSD1306_NO_SPLASH to drop the library logo (1.5 KB).
+ * v3.11: the splash shows the reset cause as R:<hex> from MCUSR
+ *        (1=power-on 2=external/reset 4=brown-out 8=watchdog). The watchdog
+ *        is disabled at boot so a stray enable cannot loop forever. GEN's
+ *        sample ISR runs at half rate to cut its CPU share, and the phase
+ *        accumulator it shares with the main loop is volatile.
+ * v3.12: the Timer1 sample interrupt is gone. The LGT8F328P has interrupt
+ *        vectors beyond the ATmega328P's 26; avr-gcc builds no handlers for
+ *        them, so they jump to address 0 and the module restarts with an
+ *        empty MCUSR (the R:0 seen on the splash). GEN is back on the burst
+ *        loop that has always been stable here, shortened 4 ms -> 1 ms so
+ *        the encoder is polled often enough to stay responsive.
+ * v3.13: do not touch the watchdog. WDTCSR/WDCE/WDE are not defined by the
+ *        LGT8F header - they come from the ATmega328P headers - and this
+ *        chip unlocks protected registers by writing 0x80 first (see PMCR,
+ *        CLKPR, ECCR in the core). avr-libc's wdt_disable() uses the plain
+ *        AVR sequence, which can leave the watchdog armed and reset us in a
+ *        loop. MCUSR is read for the splash but never written.
+ * v3.14: stack watermark. Free RAM between the heap top and the stack is
+ *        painted at the end of setup(); GEN shows the lowest level ever
+ *        reached as S:<bytes>. If that falls towards 0 the resets are a
+ *        stack overflow; if it stays comfortable they are not our RAM.
+ * v3.16: CVOUT comes from the MCP4725 on A4/A5, on LGT8F as well as ATmega.
+ *        The v2.5 rework board routes Nano D4 to ENC_B (the schematic's
+ *        LGTDAC net was never laid out), so enabling the native DAC there
+ *        drove an analog output into the encoder contact - which shorts to
+ *        GND at every detent. That browned the board out at random and the
+ *        CV jack stayed silent. The native DAC is now a fallback, used only
+ *        when no MCP4725 answers AND the encoder is not wired to D4.
+ *        GEN is offered only when a DAC actually answers on I2C. The ident
+ *        pin cannot tell us whether a DAC is fitted, and guessing wrong
+ *        drives an output into the encoder. Fit U4 (MCP4725) and GEN
+ *        appears by itself; with no DAC the mode is simply not listed.
+ * v3.17: native DAC on D4 restored, but only when the encoder is NOT wired
+ *        there (encV25). A solder jumper on the v2.5 rework board selects
+ *        what D4 carries, which is why the PCB net read as ENC_B. Order of
+ *        preference: MCP4725 if one answers on I2C, else the native DAC
+ *        when D4 is free, else GEN is not offered at all.
+ * v4.0:  two new output modes, both fed from the same DAC as GEN and so
+ *        offered only when one is available:
+ *          RND - random CV. param1 = rate (1 slow .. 8 fast), param2 = slew
+ *                (0 = stepped sample & hold, 10 = slow glide).
+ *          CLK - clock pulse. param1 = BPM (30..240), param2 = gate length
+ *                (1..8 -> 5..40 ms). Edges are scheduled from a period
+ *                anchor in micros() so the tempo does not drift.
+ *        Tuner and encoder maths are integer now: no float code is linked,
+ *        which is what paid for these modes.
+ * v4.1:  REF - fixed reference voltages for calibrating other modules.
+ *        param1 = 1..4 V (full scale is VCC, so 5 V is not reachable once
+ *        supply drop is taken off), param2 = trim +/-20 DAC steps saved per
+ *        mode. The global DAC Ofs / DAC Gn in the settings menu still apply
+ *        on top, so calibrate the scale there once and trim here.
+ * v4.4:  VOLT back, plus a third parameter slot so RND can carry range as
+ *        well as rate and slew. RND ranges widened: rate 16 s .. 7 ms,
+ *        slew 0 .. ~26 s for a full-scale move, range 10..100 % about
+ *        centre. Modes with three parameters show a fourth bar slot.
+ *        On LGT8F the MCP4725 path is compiled out: that chip's documented
+ *        wiring is the solder jumper cut to its own DAC on D4, and the I2C
+ *        code cost more flash than the modes it would have displaced.
  *
  * MODE_LFO: Continuous scrolling waveform. Trigger pin freezes a single capture.
  * MODE_WAVE: Triggered sweep, ISR-sampled. Cable in TRIGGER -> external edge
@@ -48,7 +111,7 @@
 #include <EEPROM.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <Wire.h>      // MCP4725 I2C DAC (ATmega328P v2.5)
+#include <Wire.h>      // MCP4725 I2C DAC on A4/A5 - drives CVOUT on both MCUs
 #include <Encoder.h>
 #include <SPI.h>
 #include <Adafruit_GFX.h>
@@ -96,19 +159,22 @@ Encoder *encoder = nullptr;
 #define OLED_ROT_ADDR             2
 #define MENUTIMER_DIR_ADDR        3
 #define EEPROM_MODE_ADDR          5
-#define EEPROM_PARAM_SELECT_ADDR  6   // 4 modes x 3 bytes = 12 bytes (6..17)
+#define EEPROM_PARAM_SELECT_ADDR 21   // 7 modes x 4 bytes = 28 bytes (21..48)
 #define EEPROM_CAL_OFFSET_ADDR   18  // int8_t
 #define EEPROM_CAL_GAIN_ADDR     19  // uint8_t (128=1.00x)
 #define EEPROM_HWPROFILE_ADDR    20  // 0..3 = forced profile, anything else = autodetect
 
-#define EEPROM_MAGIC_VALUE  0xA9
+#define EEPROM_MAGIC_VALUE  0xAE   // 7 modes, 4 bytes each; hwProfile at 20 is left alone
 
 // ================== Modes ==================
 #define MODE_LFO    1   // Merged LFO + SHOT (trigger = single capture)
 #define MODE_WAVE   2   // Fast ISR-sampled waveform
 #define MODE_TUNER  3
 #define MODE_GEN    4
-#define NUM_MODES   4
+#define MODE_RND    5   // random CV: rate + slew + range
+#define MODE_CLK    6   // BPM clock pulse
+#define MODE_REF    7   // fixed reference voltage
+#define NUM_MODES   7
 
 // ================== ADC / Capture Engine ==================
 #define ADC_BUFFER_SIZE 256
@@ -145,9 +211,9 @@ volatile uint8_t  drawBase = 128;           // half of buffer[] owned by the mai
 const uint8_t waveSkip[8] PROGMEM = {127, 63, 31, 15, 7, 3, 1, 0};
 
 // ================== Tuner state ==================
-float   smoothedFrequency = 0;
-uint8_t tunerSampleRate = 2;
-float   sampleRateHz = 0;
+uint16_t smoothedFx10 = 0;      // detected pitch in 0.1 Hz steps
+uint8_t  tunerSampleRate = 2;
+uint16_t sampleRateHz = 0;      // whole Hz
 
 // ================== ADC state machine ==================
 uint8_t waveState = 0;   // reset in setupMode to prevent black screen
@@ -159,8 +225,8 @@ bool isLGT8F = false;
 // (Boot logo bitmap removed for flash savings — may add smaller one later)
 
 // ================== Generator ==================
-uint32_t genPhase = 0;
-uint32_t genPhaseInc = 0;
+volatile uint32_t genPhase = 0;
+volatile uint32_t genPhaseInc = 0;
 bool     genAvailable = false;
 bool     dacIsI2C = false;       // true = MCP4725, false = native LGT8F DAC
 uint8_t  dacI2CAddr = 0;         // MCP4725 address (0 = not found)
@@ -212,16 +278,16 @@ const char noteNames[] PROGMEM = "C C#D D#E F F#G G#A A#B ";
 uint8_t buffer[ADC_BUFFER_SIZE];
 
 // ================== Mode Settings ==================
-struct ModeSettings { uint8_t param_select, param1, param2; };
+struct ModeSettings { uint8_t param_select, param1, param2, param3; };
 ModeSettings modeSettings[NUM_MODES];
 
 uint8_t mode = MODE_LFO, old_mode = MODE_LFO;
-uint8_t param_select = 0, param = 1, param1 = 2, param2 = 1;
+uint8_t param_select = 0, param = 1, param1 = 2, param2 = 1, param3 = 5;
 bool trig = 0, old_trig = 0, SW = 0, old_SW = 0;
 unsigned long hideTimer = 0;
 bool hide = 0;
 int rfrs = 0;
-float oldPosition = -999, newPosition = -999;
+long oldPosition = -999, newPosition = -999;
 bool configMenuActive = false;
 byte configMenuOption = 1;
 unsigned int menuTimer = 5;
@@ -324,6 +390,9 @@ void runLFOMode(bool showParams);
 void runWaveMode(bool showParams);
 void runTunerMode(bool showParams);
 void runGeneratorMode(bool showParams);
+void runRandomMode(bool showParams);
+void runClockMode(bool showParams);
+void runRefMode(bool showParams);
 void drawParameterBar(bool showParams);
 void configMenu();
 void saveCurrentModeToRAM();
@@ -334,7 +403,7 @@ void startADCSampling(uint16_t numSamples, uint8_t prescaler, uint8_t delaySkip,
 void drawWave(bool showParams);
 void stopADCSampling();
 uint8_t fastAnalogRead();
-float detectFrequencyZC();
+uint16_t detectFrequencyZC();
 inline void dacWrite(uint8_t value);
 inline uint8_t dcVoltageToDac(uint8_t param2_x10);
 void scanMCP4725();
@@ -420,6 +489,11 @@ uint8_t fastAnalogRead() {
   return ADCH;
 }
 
+// GEN_DAC_OFF: diagnostic build. GEN runs its UI but never enables or writes
+// the DAC, so D4 stays a plain input. If the resets stop, the fault is the
+// DAC driving D4 on this hardware, not the firmware.
+#define GEN_DAC_OFF 0      // 1 = DAC never touched (stable diagnostic build)
+
 // ================== DAC Output ==================
 // Two DAC paths depending on MCU:
 //   LGT8F:     Native on-board DAC on D4, DEFAULT (VCC) reference
@@ -450,20 +524,19 @@ void scanMCP4725() {
 }
 
 void dacInit() {
+  #if GEN_DAC_OFF
+    genSampleRate = 25000UL; genSamplePeriodUs = 40; return;
+  #endif
   #if IS_LGT8F
-    // LGT8F native DAC — VCC reference (proven linear per Wolles)
-    analogReference(DEFAULT);
+    analogReference(DEFAULT);      // native DAC on D4, VCC reference
     pinMode(DAC0, ANALOG);
     analogWrite(DAC0, 0);
-    genSampleRate = 50000UL;
-    genSamplePeriodUs = 20;
+    genSampleRate = 25000UL;
+    genSamplePeriodUs = 40;
   #else
-    // ATmega328P: MCP4725 already scanned in detectHardware()
     if (dacIsI2C) {
       Wire.beginTransmission(dacI2CAddr);
-      Wire.write(0x40);
-      Wire.write(0);
-      Wire.write(0);
+      Wire.write(0x40); Wire.write(0); Wire.write(0);
       Wire.endTransmission();
     }
     genSampleRate = 10000UL;
@@ -472,27 +545,31 @@ void dacInit() {
 }
 
 void dacStop() {
+  #if GEN_DAC_OFF
+    return;
+  #endif
   #if IS_LGT8F
     analogWrite(DAC0, 0);
     pinMode(DAC0, INPUT);
   #else
     if (dacIsI2C) {
       Wire.beginTransmission(dacI2CAddr);
-      Wire.write(0x40);
-      Wire.write(0);
-      Wire.write(0);
+      Wire.write(0x40); Wire.write(0); Wire.write(0);
       Wire.endTransmission();
     }
   #endif
 }
 
 inline void dacWrite(uint8_t value) {
+#if GEN_DAC_OFF
+  (void)value; return;
+#else
   int16_t cal = ((int16_t)value * calGain) >> 7;
   cal += calOffset;
   if (cal < 0) cal = 0;
   if (cal > 255) cal = 255;
   #if IS_LGT8F
-    analogWrite(DAC0, (uint8_t)cal);
+    DAL0 = (uint8_t)cal;                  // native DAC on D4
   #else
     if (dacIsI2C) {
       uint16_t val12 = (uint16_t)cal << 4;  // 8-bit → 12-bit
@@ -502,6 +579,8 @@ inline void dacWrite(uint8_t value) {
       Wire.endTransmission();
     }
   #endif
+
+#endif
 }
 
 // Convert DC voltage param (0.1V steps) to DAC byte
@@ -557,21 +636,21 @@ void detectHardware() {
     isHWv25 = encV25 = (analogRead(IDENT_HW_PIN) < 100);
   }
 
-  // Determine DAC availability
+  // Where does CVOUT come from? Look for an MCP4725 first: on the v2.5 rework
+  // board it drives the CV jack and D4 is ENC_B, so the native DAC must stay
+  // off there or it fights the encoder contact and browns the board out.
   #if IS_LGT8F
-    genAvailable = isHWv25 && encV25;  // native DAC on D4, which is ENC_B on mixed wiring
+    // Native DAC on D4. Only safe when the encoder is on A2/A3: a solder
+    // jumper decides what D4 carries, and driving it while it is ENC_B shorts
+    // the DAC to GND at every detent and browns the board out.
+    genAvailable = encV25;
   #else
-    if (isHWv25) {
-      // ATmega328P on v2.5: scan for MCP4725 I2C DAC
-      Wire.begin();
-      Wire.setClock(400000UL);
-      pinMode(SDA, INPUT_PULLUP);
-      pinMode(SCL, INPUT_PULLUP);
-      scanMCP4725();
-      genAvailable = dacIsI2C;
-    } else {
-      genAvailable = false;
-    }
+    Wire.begin();
+    Wire.setClock(400000UL);
+    pinMode(SDA, INPUT_PULLUP);
+    pinMode(SCL, INPUT_PULLUP);
+    scanMCP4725();
+    genAvailable = dacIsI2C;
   #endif
 
   encoder = encV25 ? new Encoder(V25_ENCODER_PIN_A, V25_ENCODER_PIN_B)
@@ -596,7 +675,7 @@ void initDisplay() {
 }
 
 // ================== Zero-Crossing Detection ==================
-float detectFrequencyZC() {
+uint16_t detectFrequencyZC() {
   uint8_t minV = 255, maxV = 0;
   for (uint16_t i = 0; i < 256; i++) {
     if (buffer[i] < minV) minV = buffer[i];
@@ -623,7 +702,9 @@ float detectFrequencyZC() {
     }
   }
   if (crossings < 2) return 0;
-  return sampleRateHz / ((float)(last - first) / (float)(crossings - 1));
+  // f = rate * (crossings-1) / span, in 0.1 Hz units.
+  // Worst case 22727 * 10 * 255 = 58e6, comfortably inside uint32_t.
+  return (uint16_t)(((uint32_t)sampleRateHz * 10UL * (crossings - 1)) / (last - first));
 }
 
 // ================== EEPROM ==================
@@ -634,10 +715,12 @@ void resetEEPROMDefaults() {
   EEPROM.update(MENUTIMER_DIR_ADDR, 5);
   EEPROM.update(EEPROM_MODE_ADDR, MODE_LFO);
   for (uint8_t m = 0; m < NUM_MODES; m++) {
-    int ba = EEPROM_PARAM_SELECT_ADDR + (m * 3);
+    int ba = EEPROM_PARAM_SELECT_ADDR + (m * 4);
     EEPROM.update(ba, 0);
     EEPROM.update(ba + 1, 2);
-    EEPROM.update(ba + 2, 1);
+    EEPROM.update(ba + 1, 2);
+    EEPROM.update(ba + 2, (m + 1 == MODE_REF) ? 20 : 1);   // REF: 20 = no trim
+    EEPROM.update(ba + 3, 5);                              // RND range: 50%
   }
   EEPROM.update(EEPROM_CAL_OFFSET_ADDR, 0);
   EEPROM.update(EEPROM_CAL_GAIN_ADDR, 128);
@@ -651,11 +734,12 @@ void loadAllSettings() {
   if (calGain < 32 || calGain > 255) calGain = 128;
 
   for (uint8_t m = 0; m < NUM_MODES; m++) {
-    int ba = EEPROM_PARAM_SELECT_ADDR + (m * 3);
+    int ba = EEPROM_PARAM_SELECT_ADDR + (m * 4);
     modeSettings[m].param_select = EEPROM.read(ba);
     modeSettings[m].param1 = EEPROM.read(ba + 1);
     modeSettings[m].param2 = EEPROM.read(ba + 2);
-    if (modeSettings[m].param_select > 3) modeSettings[m].param_select = 0;
+    modeSettings[m].param3 = constrain(EEPROM.read(ba + 3), 1, 10);
+    if (modeSettings[m].param_select > 4) modeSettings[m].param_select = 0;
 
     switch (m + 1) {
       case MODE_LFO:
@@ -674,6 +758,18 @@ void loadAllSettings() {
         modeSettings[m].param1 = 1;
         modeSettings[m].param2 = 1;
         break;
+      case MODE_REF:
+        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 4);
+        modeSettings[m].param2 = constrain(modeSettings[m].param2, 0, 40);
+        break;
+      case MODE_RND:
+        modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 12);
+        modeSettings[m].param2 = constrain(modeSettings[m].param2, 0, 20);
+        break;
+      case MODE_CLK:
+        modeSettings[m].param1 = constrain(modeSettings[m].param1, 30, 240);
+        modeSettings[m].param2 = constrain(modeSettings[m].param2, 1, 8);
+        break;
       case MODE_GEN:
         modeSettings[m].param1 = constrain(modeSettings[m].param1, 1, 5);
         if (!modeSettings[m].param1) modeSettings[m].param1 = 1;
@@ -686,17 +782,18 @@ void loadAllSettings() {
 
 void saveCurrentModeToRAM() {
   uint8_t idx = mode - 1;
-  if (idx < NUM_MODES) { modeSettings[idx].param_select = param_select; modeSettings[idx].param1 = param1; modeSettings[idx].param2 = param2; }
+  if (idx < NUM_MODES) { modeSettings[idx].param_select = param_select; modeSettings[idx].param1 = param1; modeSettings[idx].param2 = param2; modeSettings[idx].param3 = param3; }
 }
 
 void saveAllSettings() {
   EEPROM.update(EEPROM_MAGIC_ADDR, EEPROM_MAGIC_VALUE);
   EEPROM.update(EEPROM_MODE_ADDR, mode);
   for (uint8_t m = 0; m < NUM_MODES; m++) {
-    int ba = EEPROM_PARAM_SELECT_ADDR + (m * 3);
+    int ba = EEPROM_PARAM_SELECT_ADDR + (m * 4);
     EEPROM.update(ba, modeSettings[m].param_select);
     EEPROM.update(ba + 1, modeSettings[m].param1);
     EEPROM.update(ba + 2, modeSettings[m].param2);
+    EEPROM.update(ba + 3, modeSettings[m].param3);
   }
   EEPROM.update(EEPROM_CAL_OFFSET_ADDR, (uint8_t)calOffset);
   EEPROM.update(EEPROM_CAL_GAIN_ADDR, calGain);
@@ -710,6 +807,7 @@ void saveAllSettings() {
 }
 
 // ================== Setup ==================
+
 void setup() {
   detectHardware();
 
@@ -722,7 +820,7 @@ void setup() {
 
   uint8_t lastMode = EEPROM.read(EEPROM_MODE_ADDR);
   mode = (lastMode >= MODE_LFO && lastMode <= MODE_GEN) ? lastMode : MODE_LFO;
-  if (mode == MODE_GEN && !genAvailable) mode = MODE_LFO;
+  if (mode > MODE_TUNER && !genAvailable) mode = MODE_LFO;  // GEN/RND/CLK/REF need the DAC
 
   initDisplay();
 
@@ -733,7 +831,7 @@ void setup() {
   display->print(F("SCOPE"));
   display->setTextSize(1);
   display->setCursor(16, 32);
-  display->print(F("Modulove v3.9"));
+  display->print(F("Modulove v4.5"));
   display->setCursor(0, 56);
   display->print(isHWv25 ? F("v2.5") : F("v2"));
   display->print(isLGT8F ? F(" LGT") : F(" 328"));
@@ -774,30 +872,39 @@ void loop() {
 
   newPosition = encoderDirection * encoder->read();
   if (old_SW == 0 && SW == 1 && param_select == param) { param_select = 0; hideTimer = millis(); }
-  else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 3)) { param_select = param; hideTimer = millis(); }
+  else if (old_SW == 0 && SW == 1 && (param >= 1 && param <= 4)) { param_select = param; hideTimer = millis(); }
 
   newPosition = encoderDirection * encoder->read();
   int8_t enc = 0;
-  if ((newPosition - 3) / 4 > oldPosition / 4) { oldPosition = newPosition; hideTimer = millis(); enc = -1; }
-  else if ((newPosition + 3) / 4 < oldPosition / 4) { oldPosition = newPosition; hideTimer = millis(); enc = 1; }
+  if (newPosition - 3 > oldPosition) { oldPosition = newPosition; hideTimer = millis(); enc = -1; }
+  else if (newPosition + 3 < oldPosition) { oldPosition = newPosition; hideTimer = millis(); enc = 1; }
 
   if (enc) {
     switch (param_select) {
       case 0: { // Param slot rollover
-        uint8_t mx = (mode == MODE_TUNER) ? 1 : 3;
+        uint8_t mx = (mode == MODE_TUNER) ? 1 : (mode == MODE_RND ? 4 : 3);
         param += enc;
         if (param < 1) param = mx;
         if (param > mx) param = 1;
       } break;
-      case 1: // Mode rollover (skip GEN on v2)
+      case 1: {  // Mode rollover. GEN/RND/CLK need a DAC, so without one the
+                 // list stops at TUNER rather than offering silent modes.
+        uint8_t mmax = genAvailable ? NUM_MODES : MODE_TUNER;
         mode += enc;
-        if (mode < 1) mode = NUM_MODES;
-        if (mode > NUM_MODES) mode = 1;
-        if (mode == MODE_GEN && !genAvailable) { mode += enc; if (mode < 1) mode = NUM_MODES; if (mode > NUM_MODES) mode = 1; }
-        break;
+        if (mode < 1) mode = mmax;
+        if (mode > mmax) mode = 1;
+      } break;
       case 2: { // Param1 rollover
-        int8_t mn = 1, mx;
-        switch (mode) { case MODE_LFO: case MODE_WAVE: mx = 8; break; case MODE_TUNER: mx = 1; break; case MODE_GEN: mx = 5; break; default: mx = 8; }
+        int16_t mn = 1, mx;
+        switch (mode) {
+          case MODE_LFO: case MODE_WAVE: mx = 8; break;
+          case MODE_TUNER: mx = 1; break;
+          case MODE_GEN: mx = 5; break;
+          case MODE_RND: mx = 12; break;            // rate
+          case MODE_CLK: mn = 30; mx = 240; break;   // BPM
+          case MODE_REF: mx = 4; break;              // volts
+          default: mx = 8;
+        }
         param1 += enc;
         if (param1 < mn) param1 = mx;
         if (param1 > mx) param1 = mn;
@@ -806,12 +913,20 @@ void loop() {
           else { if (param2 > GEN_NUM_FREQS || param2 == 0) param2 = 4; }
         }
       } break;
+      case 4: { // Param3 rollover (RND range)
+        param3 += enc;
+        if (param3 < 1) param3 = 10;
+        if (param3 > 10) param3 = 1;
+      } break;
       case 3: { // Param2 rollover
-        int8_t mn, mx;
+        int16_t mn, mx;
         switch (mode) {
           case MODE_LFO: mn = -6; mx = 10; break;
           case MODE_WAVE: mn = 1; mx = 6; break;
           case MODE_GEN: mn = (param1 == 5) ? 0 : 1; mx = (param1 == 5) ? GEN_DC_MAX : GEN_NUM_FREQS; break;
+          case MODE_RND: mn = 0; mx = 20; break;     // slew
+          case MODE_CLK: mn = 1; mx = 8; break;      // gate length
+          case MODE_REF: mn = 0; mx = 40; break;     // trim, 20 = centre
           default: mn = 1; mx = 1; break;
         }
         param2 += enc;
@@ -837,7 +952,10 @@ void loop() {
     case MODE_LFO:   runLFOMode(sp);       break;
     case MODE_WAVE:  runWaveMode(sp);      break;
     case MODE_TUNER: runTunerMode(sp);     break;
-    case MODE_GEN:   runGeneratorMode(sp); return;  // GEN handles its own display
+    case MODE_GEN:   runGeneratorMode(sp); return;  // these handle their own display
+    case MODE_RND:   runRandomMode(sp);    return;
+    case MODE_CLK:   runClockMode(sp);     return;
+    case MODE_REF:   runRefMode(sp);       return;
   }
   display->display();
 }
@@ -847,7 +965,7 @@ void setupMode(uint8_t m) {
   stopADCSampling();
   if (genAvailable) dacStop();  // Always release DAC pin when switching modes
   uint8_t idx = m - 1;
-  if (idx < NUM_MODES) { param_select = modeSettings[idx].param_select; param1 = modeSettings[idx].param1; param2 = modeSettings[idx].param2; }
+  if (idx < NUM_MODES) { param_select = modeSettings[idx].param_select; param1 = modeSettings[idx].param1; param2 = modeSettings[idx].param2; param3 = modeSettings[idx].param3; }
 
   switch (m) {
     case MODE_LFO:
@@ -863,8 +981,15 @@ void setupMode(uint8_t m) {
     case MODE_TUNER:
       analogWrite(OFFSET_PIN, 127);
       pinMode(FILTER_PIN, INPUT);
-      smoothedFrequency = 0;
+      smoothedFx10 = 0;
       tunerSampleRate = 2;
+      break;
+    case MODE_RND:
+    case MODE_CLK:
+    case MODE_REF:
+      analogWrite(OFFSET_PIN, 0);
+      pinMode(FILTER_PIN, INPUT);
+      dacInit();
       break;
     case MODE_GEN:
       analogWrite(OFFSET_PIN, 0);
@@ -1023,7 +1148,7 @@ void runTunerMode(bool showParams) {
   param = 1;  // Tuner has no adjustable params
 
   static unsigned long lastUp = 0, stateStart = 0;
-  static float lastValid = 0;
+  static uint16_t lastValid = 0;
 
   switch (tunerState) {
     case 0:
@@ -1032,15 +1157,15 @@ void runTunerMode(bool showParams) {
         // Auto sample rate based on detected frequency
         // ATmega328P: 13 ADC clocks/conversion (free-running)
         // LGT8F:     ~22 ADC clocks/conversion (measured empirically)
-        if (lastValid < 80 || tunerSampleRate == 1) {
+        if (lastValid < 800 || tunerSampleRate == 1) {
           ps = 0x07; ds = 1; tunerSampleRate = 1;
-          sampleRateHz = IS_LGT8F ? 5682.0f : 4808.0f;  // LGT8F: 32M/128/22/2
-        } else if (lastValid < 200 || tunerSampleRate == 2) {
+          sampleRateHz = IS_LGT8F ? 5682 : 4808;   // LGT8F: 32M/128/22/2
+        } else if (lastValid < 2000 || tunerSampleRate == 2) {
           ps = 0x07; ds = 0; tunerSampleRate = 2;
-          sampleRateHz = IS_LGT8F ? 11364.0f : 9615.0f;  // LGT8F: 32M/128/22
+          sampleRateHz = IS_LGT8F ? 11364 : 9615;  // LGT8F: 32M/128/22
         } else {
           ps = 0x06; ds = 0; tunerSampleRate = 3;
-          sampleRateHz = IS_LGT8F ? 22727.0f : 19230.0f;  // LGT8F: 32M/64/22
+          sampleRateHz = IS_LGT8F ? 22727 : 19230; // LGT8F: 32M/64/22
         }
         startADCSampling(256, ps, ds, TRIG_NONE, false); tunerState = 1; stateStart = millis();
       } break;
@@ -1049,13 +1174,20 @@ void runTunerMode(bool showParams) {
       else if (millis() - stateStart > 200) { stopADCSampling(); tunerState = 0; }  // timeout — retry
       break;
     case 2: {
-      float raw = detectFrequencyZC();
-      if (raw > 15 && raw < 5000) {
+      uint16_t raw = detectFrequencyZC();
+      if (raw > 150 && raw < 50000) {           // 15.0 .. 5000.0 Hz
         lastValid = raw;
-        if (smoothedFrequency < 10) smoothedFrequency = raw;
-        else { float a = (abs(raw - smoothedFrequency) / smoothedFrequency > 0.1f) ? 0.5f : 0.35f; smoothedFrequency = smoothedFrequency * (1 - a) + raw * a; }
-        tunerSampleRate = (smoothedFrequency < 60) ? 1 : (smoothedFrequency < 150) ? 2 : 3;
-      } else { smoothedFrequency *= 0.85f; if (smoothedFrequency < 15) { smoothedFrequency = 0; tunerSampleRate = 2; } }
+        if (smoothedFx10 < 100) smoothedFx10 = raw;
+        else {
+          uint16_t d = (raw > smoothedFx10) ? raw - smoothedFx10 : smoothedFx10 - raw;
+          uint8_t a = ((uint32_t)d * 10 > smoothedFx10) ? 50 : 35;   // jumped >10% -> track faster
+          smoothedFx10 = (uint16_t)(((uint32_t)smoothedFx10 * (100 - a) + (uint32_t)raw * a) / 100);
+        }
+        tunerSampleRate = (smoothedFx10 < 600) ? 1 : (smoothedFx10 < 1500) ? 2 : 3;
+      } else {
+        smoothedFx10 = (uint16_t)(((uint32_t)smoothedFx10 * 85) / 100);
+        if (smoothedFx10 < 150) { smoothedFx10 = 0; tunerSampleRate = 2; }
+      }
       lastUp = millis(); tunerState = 0;
     } break;
   }
@@ -1067,8 +1199,8 @@ void runTunerMode(bool showParams) {
   display->clearDisplay();
   int yO = showParams ? 10 : 0;
 
-  if (smoothedFrequency > 15) {
-    uint16_t fx10 = (uint16_t)(smoothedFrequency * 10.0f);
+  if (smoothedFx10 > 150) {
+    uint16_t fx10 = smoothedFx10;
     char note[3]; int8_t oct, cents;
     frequencyToNote(fx10, note, &oct, &cents);
 
@@ -1147,8 +1279,9 @@ void runGeneratorMode(bool showParams) {
       lastSample = nowComp;  // Too long — resync without phase jump
     }
 
-    // Waveform mode: output samples in tight loop for ~4ms
-    unsigned long burstEnd = micros() + 4000;
+    // Waveform mode: short output burst. 4 ms starved the encoder poll and
+    // made the module look frozen; 1 ms keeps the UI responsive.
+    unsigned long burstEnd = micros() + 1000;
     while ((long)(micros() - burstEnd) < 0) {
       unsigned long nowUs = micros();
       if (nowUs - lastSample >= genSamplePeriodUs) {
@@ -1229,6 +1362,148 @@ void runGeneratorMode(bool showParams) {
   display->display();
 }
 
+// ================== Random CV ==================
+// param1 = rate (1 slowest .. 8 fastest), param2 = slew (0 stepped .. 10 smooth)
+// A new target is drawn every interval; the output glides towards it so the
+// same rate can give stepped sample & hold or a slow wander.
+uint16_t rndState = 0xACE1;
+static uint8_t rnd8() {
+  rndState ^= rndState << 7;
+  rndState ^= rndState >> 9;
+  rndState ^= rndState << 8;
+  return (uint8_t)(rndState >> 8);
+}
+
+void runRandomMode(bool showParams) {
+  param  = constrain(param, 1, 4);
+  param1 = constrain(param1, 1, 12);
+  param2 = constrain(param2, 0, 20);
+  param3 = constrain(param3, 1, 10);
+
+  static unsigned long lastStep = 0, lastGlide = 0, lastDraw = 0;
+  static uint8_t target = 128, cur = 128;
+  unsigned long now = millis();
+
+  uint16_t interval = 16000 >> (param1 - 1);         // 16 s .. 7 ms
+  if (now - lastStep >= interval) {
+    lastStep = now;
+    int16_t r = (int16_t)rnd8() - 128;               // range is a share of full scale
+    target = (uint8_t)(128 + (r * (int16_t)param3) / 10);
+  }
+
+  // Linear glide: one DAC step every glideMs, so slew is a time, not a ratio.
+  uint16_t glideMs = (uint16_t)param2 * param2 / 4 + 1;   // 1 .. 101 ms per step
+  if (param2 == 0) {
+    if (cur != target) { cur = target; dacWrite(cur); }
+  } else if (now - lastGlide >= glideMs) {
+    lastGlide = now;
+    if (cur < target) cur++; else if (cur > target) cur--;
+    dacWrite(cur);
+  }
+
+  {
+    static unsigned long lastTrace = 0;
+    if (now != lastTrace) { lastTrace = now; memmove(&buffer[1], &buffer[0], 127); buffer[0] = cur; }
+  }
+
+  if (now - lastDraw < 40) return;
+  lastDraw = now;
+  display->clearDisplay();
+  int yO = showParams ? 12 : 2;
+  for (uint8_t i = 1; i < 127; i++) {
+    int y1 = yO + 48 - ((int)buffer[i - 1] * 46 / 255);
+    int y2 = yO + 48 - ((int)buffer[i] * 46 / 255);
+    display->drawLine(127 - i, y1, 126 - i, y2, WHITE);
+  }
+  if (showParams) drawParameterBar(true);
+  display->display();
+}
+
+// ================== BPM Clock ==================
+// param1 = BPM (30..240), param2 = gate length (1..8 -> 5..40 ms).
+// Edges are scheduled from a period anchor rather than "now + period", so a
+// slow display frame cannot make the tempo drift.
+void runClockMode(bool showParams) {
+  param  = constrain(param, 1, 3);
+  param1 = constrain(param1, 30, 240);
+  param2 = constrain(param2, 1, 8);
+
+  static unsigned long anchor = 0, lastDraw = 0;
+  static bool gateHigh = false;
+  unsigned long nowUs = micros();
+  uint32_t periodUs = 60000000UL / param1;
+  uint32_t gateUs   = (uint32_t)param2 * 5000UL;
+  if (gateUs > periodUs / 2) gateUs = periodUs / 2;
+
+  uint32_t into = nowUs - anchor;
+  if (into >= periodUs) {
+    if (into > periodUs * 2) anchor = nowUs; else anchor += periodUs;
+    gateHigh = true;  dacWrite(255);
+  } else if (gateHigh && into >= gateUs) {
+    gateHigh = false; dacWrite(0);
+  }
+
+  if (millis() - lastDraw < 60) return;
+  lastDraw = millis();
+  display->clearDisplay();
+  int yO = showParams ? 10 : 0;
+
+  char b[8];
+  fmtInt(b, param1);
+  display->setTextSize(2);
+  display->setCursor((128 - (int)strlen(b) * 12) / 2, yO + 8);
+  display->print(b);
+  display->setTextSize(1);
+  display->setCursor(52, yO + 26);
+  display->print(F("BPM"));
+  display->setCursor(0, yO + 40);
+  display->print(F("GATE "));
+  display->print(param2 * 5);
+  display->print(F("ms"));
+  if (gateHigh) display->fillRect(110, yO + 37, 11, 11, WHITE);
+  else          display->drawRect(110, yO + 37, 11, 11, WHITE);
+
+  if (showParams) drawParameterBar(true);
+  display->display();
+}
+
+// ================== Reference Voltage ==================
+// param1 = 1..4 V, param2 = trim (20 = centre, +/-20 DAC steps). Full scale is
+// VCC, so 5 V is out of reach once supply drop is accounted for. The global
+// DAC Ofs / DAC Gn calibration in the settings menu applies on top of this.
+void runRefMode(bool showParams) {
+  param  = constrain(param, 1, 3);
+  param1 = constrain(param1, 1, 4);
+  param2 = constrain(param2, 0, 40);
+
+  int16_t code = (int16_t)dcVoltageToDac(param1 * 10) + ((int16_t)param2 - 20);
+  if (code < 0) code = 0;
+  if (code > 255) code = 255;
+  dacWrite((uint8_t)code);
+
+  static unsigned long lastDraw = 0;
+  if (millis() - lastDraw < 150) return;
+  lastDraw = millis();
+
+  display->clearDisplay();
+  int yO = showParams ? 10 : 0;
+  char b[3]; b[0] = '0' + param1; b[1] = 'V'; b[2] = ' ';
+  display->setTextSize(3);
+  display->setCursor(46, yO + 10);
+  display->print(b);
+  display->setTextSize(1);
+  display->setCursor(0, yO + 40);
+  display->print(F("DAC "));
+  display->print(code);
+  display->setCursor(66, yO + 40);
+  display->print(F("TRM "));
+  int8_t t = (int8_t)param2 - 20;
+  if (t >= 0) display->print('+');
+  display->print(t);
+  if (showParams) drawParameterBar(true);
+  display->display();
+}
+
 // ================== Parameter Bar ==================
 // Navigation feedback:
 //   browsing (param_select == 0) -> slot under the cursor (param) is underlined
@@ -1255,6 +1530,9 @@ void drawParameterBar(bool showParams) {
     case MODE_WAVE:  display->print(F("WAVE")); break;
     case MODE_TUNER: display->print(F("TUNE")); break;
     case MODE_GEN:   display->print(F("GEN"));  break;
+    case MODE_RND:   display->print(F("RND"));  break;
+    case MODE_CLK:   display->print(F("CLK"));  break;
+    case MODE_REF:   display->print(F("REF"));  break;
   }
   barSlotEnd(1, 0);
 
@@ -1269,6 +1547,9 @@ void drawParameterBar(bool showParams) {
       char w[4]; memcpy_P(w, genWaveNames[constrain(param1, 1, 5) - 1], 4);
       display->print(w);
     } break;
+    case MODE_RND: display->print(F("R:")); display->print(param1); break;
+    case MODE_CLK: display->print(param1); display->print(F("bpm")); break;
+    case MODE_REF: display->print(param1); display->print('V'); break;
   }
   barSlotEnd(2, 36);
 
@@ -1284,6 +1565,16 @@ void drawParameterBar(bool showParams) {
       display->print(f);
     }
     barSlotEnd(3, 66);
+  } else if (mode == MODE_REF) {
+    barSlotBegin(3, 78);
+    display->print(F("T:"));
+    display->print((int8_t)param2 - 20);
+    barSlotEnd(3, 78);
+  } else if (mode == MODE_RND || mode == MODE_CLK) {
+    barSlotBegin(3, 78);
+    display->print(mode == MODE_RND ? F("S:") : F("G:"));
+    display->print(param2);
+    barSlotEnd(3, 78);
   } else if (mode != MODE_TUNER) {
     barSlotBegin(3, 78);
     display->print(mode == MODE_LFO ? F("O:") : F("R:"));
@@ -1291,8 +1582,16 @@ void drawParameterBar(bool showParams) {
     barSlotEnd(3, 78);
   }
 
+  // Slot 4: only modes with a third parameter use it
+  if (mode == MODE_RND) {
+    barSlotBegin(4, 100);
+    display->print(F("A:"));
+    display->print(param3);
+    barSlotEnd(4, 100);
+  }
+
   // Restore transparent white text, otherwise the next frame of the mode
-  // screen inherits the inverted colors of an edited slot 3
+  // screen inherits the inverted colors of an edited slot
   display->setTextColor(WHITE);
 }
 
