@@ -39,8 +39,7 @@ The last four need a DAC and are hidden if none is fitted.
 
 **Using `REF` as an octave source:** whole volts land on exact DAC codes (51 steps per
 volt), so 1/2/3/4 V come out with no quantisation error — useful as a precise octave
-offset. Sum it with your melody externally; do not route the melody through the module,
-as the 8-bit converters would quantise pitch to about 24 cents per step.
+offset. 
 
 **Calibrating the DAC:** set `REF` to 4 V, adjust `DAC Gn` in the settings menu until a
 meter reads 4.00 V, then check 1 V and correct with `DAC Ofs`. The output is ratiometric
@@ -68,19 +67,13 @@ The CV output can be driven either by the on-board **MCP4725** (U4) or by the
 **LGT8F328P's own DAC on D4**, and a solder jumper selects which. If you fit an
 LGT8F328P board, **cut the jumper's default trace and bridge it to the LGT8F DAC side.**
 
-Left on the default setting, D4 goes to the encoder instead. The firmware would then
-drive an analog output into the encoder's B contact, which shorts to ground at every
-detent — the module resets at random and the CV jack stays silent.
+Left on the default setting, the module resets at random and the CV jack stays silent.
 
 Which DAC the firmware uses depends on the board:
 
 - **LGT8F328P builds** use the chip's own DAC on D4 — this is why the jumper must be
   moved. The MCP4725 path is not compiled into this build.
 - **ATmega328P builds** use the MCP4725 (U4) over I²C.
-
-Getting it wrong cannot damage anything. On an LGT8F the DAC is only enabled when the
-encoder is on A2/A3, so D4 is never driven while it carries `ENC_B`; the output modes
-(GEN, RND, CLK, REF) are simply left out of the mode list instead.
 
 > Flash the firmware that matches your PCB. The v2 firmware does not run on v1 (black PCB) hardware.
 
@@ -90,9 +83,6 @@ encoder is on A2/A3, so D4 is never driven while it carries `ENC_B`; the output 
 
 **Easiest:** flash from the browser (Chrome, Edge or Opera) at **[dl.modulove.io/scope](https://dl.modulove.io/scope/)** — pick *Nano*, *Nano (old bootloader)* or *LGT8F328P* to match your board. Disconnect Eurorack power before plugging in USB.
 
-Pre-built `.hex` files for every board are attached to each [release](https://github.com/modulove/SCOPE/releases). They are produced by the GitHub Actions workflow on every `vX.Y.Z` tag.
-
-**Build it yourself** with [arduino-cli](https://arduino.github.io/arduino-cli/):
 
 ```sh
 # boards: arduino:avr:nano | arduino:avr:nano:cpu=atmega328old | lgt8fx:avr:328
