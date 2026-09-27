@@ -22,12 +22,35 @@ SCOPE is Modulove's adaptation of the [HAGIWO OLED oscilloscope](https://note.co
 - Trigger input for a stable, locked waveform display and one-shot capture of transients
 - Tuner mode
 - Function generator output on the newest hardware revision (v2.5) — sine, triangle, saw, square and DC
+- Random CV with rate, slew and range — from stepped sample & hold to a slow wander
+- Clock output with BPM and gate length
+- Fixed 1/2/3/4 V references for calibrating other modules
 - Web-based firmware uploader — update from your browser, no Arduino IDE needed
 - 6HP, skiff friendly, 40 mA (+12 V) / 10 mA (−12 V)
 - Beginner friendly: all SMD parts come pre-soldered, only through-hole assembly left
 - Available as panel + PCB kit, full DIY kit, or built module
 
+**Modes:** `LFO` scrolling view · `WAVE` triggered sweep · `TUNER` pitch and cents ·
+`GEN` function generator · `RND` random CV (rate + slew + range) · `CLK` clock pulse
+(BPM + gate) · `REF` fixed 1–4 V reference.
+The last four need a DAC and are hidden if none is fitted.
+
+`RND` is the one mode with three parameters, so its parameter bar has a fourth slot.
+
+**Using `REF` as an octave source:** whole volts land on exact DAC codes (51 steps per
+volt), so 1/2/3/4 V come out with no quantisation error — useful as a precise octave
+offset. Sum it with your melody externally; do not route the melody through the module,
+as the 8-bit converters would quantise pitch to about 24 cents per step.
+
+**Calibrating the DAC:** set `REF` to 4 V, adjust `DAC Gn` in the settings menu until a
+meter reads 4.00 V, then check 1 V and correct with `DAC Ofs`. The output is ratiometric
+to VCC, so calibrate on the supply you will actually use — a 1 % VCC error is 12 cents.
+
 **Controls:** short press — switch menu slot · rotate — adjust · medium press (1–2 s) — save settings · long press (> 3 s) — global settings (encoder direction, menu timeout, display orientation)
+
+**Display dark after flashing?** Hold the encoder button while powering up to step through
+the four hardware profiles (display and encoder wiring); the splash shows the active one as
+`P0`–`P3` and the choice is saved.
 
 ![SCOPE firmware UI](https://dl.modulove.de/module/scope/img/SCOPE_Firmware_UI_Main_887x512.png)
 
@@ -37,7 +60,27 @@ SCOPE is Modulove's adaptation of the [HAGIWO OLED oscilloscope](https://note.co
 |---|---|---|---|
 | SCOPE v1 | black | [`Firmware/SCOPE`](Firmware/SCOPE) | Oscilloscope (LFO / WAVE / SHOT), Spectrum analyzer, Tuner |
 | SCOPE v2 | green | [`Firmware/SCOPEv2`](Firmware/SCOPEv2) | LFO, WAVE (triggered), TUNER |
-| SCOPE v2.5 | colorful, LGT8F328P or Nano | [`Firmware/SCOPEv2`](Firmware/SCOPEv2) | as v2 + GEN (function generator) |
+| SCOPE v2.5 | colorful, LGT8F328P or Nano | [`Firmware/SCOPEv2`](Firmware/SCOPEv2) | as v2 + GEN, RND, CLK, REF |
+
+### ⚠️ LGT8F328P boards: set the DAC solder jumper
+
+The CV output can be driven either by the on-board **MCP4725** (U4) or by the
+**LGT8F328P's own DAC on D4**, and a solder jumper selects which. If you fit an
+LGT8F328P board, **cut the jumper's default trace and bridge it to the LGT8F DAC side.**
+
+Left on the default setting, D4 goes to the encoder instead. The firmware would then
+drive an analog output into the encoder's B contact, which shorts to ground at every
+detent — the module resets at random and the CV jack stays silent.
+
+Which DAC the firmware uses depends on the board:
+
+- **LGT8F328P builds** use the chip's own DAC on D4 — this is why the jumper must be
+  moved. The MCP4725 path is not compiled into this build.
+- **ATmega328P builds** use the MCP4725 (U4) over I²C.
+
+Getting it wrong cannot damage anything. On an LGT8F the DAC is only enabled when the
+encoder is on A2/A3, so D4 is never driven while it carries `ENC_B`; the output modes
+(GEN, RND, CLK, REF) are simply left out of the mode list instead.
 
 > Flash the firmware that matches your PCB. The v2 firmware does not run on v1 (black PCB) hardware.
 

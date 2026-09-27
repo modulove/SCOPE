@@ -52,7 +52,12 @@ jobs:
       - name: Compile sketch and rename output file for release
         working-directory: ./Firmware
         run: |
-          arduino-cli compile -v -b ${{ matrix.board}} ${{ matrix.firmware}} -e --output-dir=./build/${{ matrix.boardpath }}
+          # SSD1306_NO_SPLASH drops the Adafruit library's logo bitmaps (~1.5 KB of
+          # flash). Without it the LGT8F build overflows. TWI_BUFFER_LENGTH trims the
+          # Wire buffers Adafruit_SSD1306 drags in but the firmware never uses (72 B RAM).
+          # These must go in build.extra_flags: it reaches .c files too (twi.c), which
+          # compiler.cpp.extra_flags does not.
+          arduino-cli compile -v -b ${{ matrix.board}} ${{ matrix.firmware}} -e --output-dir=./build/${{ matrix.boardpath }} \n            --build-property "build.extra_flags=-DSSD1306_NO_SPLASH -DTWI_BUFFER_LENGTH=8"
           mkdir -p ./release
           cp ./build/${{ matrix.boardpath }}/${{ matrix.firmware }}.ino.hex ./release/${{ matrix.firmware }}.${{ matrix.boardpath }}.hex
 
