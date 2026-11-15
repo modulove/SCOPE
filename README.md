@@ -83,9 +83,12 @@ Which DAC the firmware uses depends on the board:
 steered with the encoder (hold + turn sets the walking speed, click fires, so does
 the TRIG jack). On LGT8F328P boards it plays sound effects and music on CV OUT;
 like GEN, that needs the DAC jumper on the LGT8F side, and sound stays off until
-you switch it on in the game's SETUP screen. See its
-[README](Firmware/SCOPE_DOOM/README.md). Flashing it (or anything else) erases the
-LGT8F's emulated EEPROM, so redo `DAC Gn` / `DAC Ofs` after going back to the scope.
+you switch it on in the game's SETUP screen. Left alone for a minute, it plays
+itself (attract mode) until you turn or press the encoder. See its
+[README](Firmware/SCOPE_DOOM/README.md). Uploading firmware does not erase the
+LGT8F's settings (measured). DOOM keeps its own settings at EEPROM 1000-1002 and
+only touches SCOPE's byte 20 (hardware profile) if you hold the button at
+power-up to cycle profiles.
 
 ## Firmware
 

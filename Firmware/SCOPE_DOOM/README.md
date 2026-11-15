@@ -22,11 +22,23 @@ boards with a Nano and on v2 (green) boards, but without sound (see
 The shotgun takes shells. With none left you punch. Kill 20 imps on the
 first level, then find the exit of the second.
 
+## Demo (attract mode)
+
+Leave the module alone for **one minute**, on any screen or in the middle of a
+game, and it starts playing by itself: `DEMO` in the top left corner, the two
+levels in turn, a new round after every death. So an unused SCOPE in the rack
+always shows something, and the OLED does not burn in a still picture.
+
+- **Any turn or press** ends the demo and goes back to the title.
+- The **TRIG** jack does not end it (a patched clock keeps running into it).
+- Sound follows your SETUP choice. The demo changes no stored settings.
+
 ## Setup screen
 
 Shown after the skill level:
 
-- **SOUND**: OFF, EFFECTS, or FX AND MUSIC. Sound is **off** after flashing.
+- **SOUND**: OFF, EFFECTS, or FX AND MUSIC. Sound is **off** until you switch
+  it on here.
 - **STEER**: NORMAL or REVERSED. Use REVERSED if turning the encoder
   clockwise turns you left.
 - **START**: stores both settings and starts the game.
@@ -55,8 +67,8 @@ screen shows the result, for example `V2.5 LGT DAC`.
 
 If the display stays dark, **hold the encoder while powering up**. Each hold
 steps to the next of the four profiles (`P0`–`P3`), and the choice is stored.
-The LGT8F's emulated EEPROM is erased on every upload, so after flashing it
-starts on autodetect again.
+It is the same stored byte the SCOPE firmware uses, so both always agree on
+the wiring.
 
 ## Flashing
 
@@ -70,9 +82,10 @@ arduino-cli compile -b lgt8fx:avr:328 -u -p COM5 Firmware/SCOPE_DOOM
 The sketch has its own SSD1306 driver, so it needs no Adafruit libraries. It
 fills the LGT8F's 29,696 bytes to 99 %.
 
-> **Going back to the scope:** reflash `Firmware/SCOPEv2`. On LGT8F boards,
-> every upload erases the emulated EEPROM. Redo `DAC Gn` / `DAC Ofs` and your
-> settings afterwards.
+> **Going back to the scope:** reflash `Firmware/SCOPEv2`. Uploading firmware
+> does not erase the LGT8F's settings (measured). DOOM keeps its own settings
+> at EEPROM 1000-1002 and only touches SCOPE's byte 20 (hardware profile) if
+> you hold the button at power-up to cycle profiles.
 
 ## Credits and licence
 

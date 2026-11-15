@@ -36,6 +36,9 @@
 #define THROTTLE_MIN     -1      // hold + turn sets the walking speed (cruise control)
 #define THROTTLE_MAX      3
 
+// Attract mode: the game plays itself after this long without a turn or press
+#define DEMO_IDLE_MS     60000
+
 // GFX settings
 #define OPTIMIZE_SSD1306                // Optimizations for SSD1366 displays
 

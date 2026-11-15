@@ -333,7 +333,9 @@ void sound_stop_timer() {
 #ifndef HOST
   TIMSK2 = 0;
   #if IS_LGT8F
-  if (dacEnabled) DAL0 = 0;
+  // Off, not just 0 V: after the soft reset (a jump, not a hardware reset) the
+  // DAC must not keep driving D4 while sound is off.
+  if (dacEnabled) dacPower(false);
   #endif
 #endif
 }

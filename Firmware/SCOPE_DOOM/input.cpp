@@ -23,6 +23,7 @@ static int8_t   encDir = 1;
 static volatile int16_t freeCount = 0;    // counts, button up
 static volatile int16_t heldCount = 0;    // counts, button held
 static volatile uint8_t evFire = 0, evLong = 0, evTrig = 0;
+static volatile uint16_t idleMs = 0;      // since the last turn or press
 
 // ISR-only state
 static bool     btnDown = false;          // debounced
@@ -63,6 +64,7 @@ void input_isr_encoder() {
   int8_t d = (int8_t)(encLast - p);
   if (!d) return;
   encLast = p;
+  idleMs = 0;
   if (encDir < 0) d = -d;
   if (btnDown) {
     heldCount += d;
@@ -90,9 +92,14 @@ void input_isr_ms() {
   } else {
     btnBounce = 0;
   }
-  if (btnDown && !btnUsed && ++btnMs >= LONG_PRESS_MS) {
-    btnUsed = true;
-    evLong = 1;
+  if (btnDown) {
+    idleMs = 0;
+    if (!btnUsed && ++btnMs >= LONG_PRESS_MS) {
+      btnUsed = true;
+      evLong = 1;
+    }
+  } else if (idleMs != 0xFFFF) {
+    idleMs++;
   }
 
   bool t = TRIG_HIGH();
@@ -136,6 +143,21 @@ static bool takeFlag(volatile uint8_t &f) {
   if (!f) return false;
   f = 0;                               // single byte: atomic on AVR
   return true;
+}
+
+uint16_t input_idle_ms() {
+  INPUT_IDLE();
+  noInterrupts();
+  uint16_t v = idleMs;
+  interrupts();
+  return v;
+}
+
+bool input_held() { INPUT_IDLE(); return *(volatile bool *)&btnDown; }   // the ISR changes it
+
+void wait_ms(uint16_t ms) {
+  uint16_t t0 = millis();                      // 16 bits are enough for the 1 s maximum
+  while ((uint16_t)((uint16_t)millis() - t0) < ms) INPUT_IDLE();
 }
 
 bool input_fire() { return takeFlag(evFire); }

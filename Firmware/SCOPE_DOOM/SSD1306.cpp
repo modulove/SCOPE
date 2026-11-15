@@ -39,6 +39,7 @@
 #include <SPI.h>
 #include "SSD1306.h"
 #include "constants.h"
+#include "input.h"
 
 // ================== SCOPE OLED transport ==================
 // All OLED pins are on port B on both revisions, so the bit-bang path and the
@@ -159,9 +160,9 @@ bool Adafruit_SSD1306<WIDTH, HEIGHT>::begin(uint8_t vcs, uint8_t addr) {
     PORTB |= _BV(2) | _BV(4);                  // CLK idle high, CS high
   }
   PORTB &= ~oledRST;
-  delay(10);
+  wait_ms(10);
   PORTB |= oledRST;
-  delay(10);
+  wait_ms(10);
 #endif
 
   // Init sequence for the SCOPE's 128x64 panel, internal charge pump

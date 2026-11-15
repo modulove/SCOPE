@@ -28,6 +28,14 @@ bool   input_fire();       // a click: press and release without turning or hold
 bool   input_long();       // held LONG_PRESS_MS without turning (fires once per press)
 bool   input_trig();       // rising edge on the TRIG jack since the last call
 
+// Attract mode: milliseconds since the last turn or press, saturating at
+// 65535. The TRIG jack does not count, so a patched clock cannot keep the demo
+// from starting.
+uint16_t input_idle_ms();
+bool   input_held();       // the button is down (debounced)
+
+void   wait_ms(uint16_t ms);   // delay() without micros(): 170 bytes less flash
+
 // Called from the sound timer interrupt only.
 void   input_isr_encoder();   // ~4 kHz
 void   input_isr_ms();        // ~1 kHz

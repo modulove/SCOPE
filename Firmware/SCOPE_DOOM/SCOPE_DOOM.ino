@@ -15,10 +15,12 @@
  *     walk; click = fire; TRIG jack = fire.
  *   - The screen renders as fast as the hardware allows (30 fps cap) while the
  *     game logic keeps the original 15 Hz tick, so difficulty is unchanged.
+ *   - Attract mode: after a minute without input the game plays itself.
  *   - Fixes, see FIXES in the README.
  *
  * Controls: turn = look, hold + turn = walking speed, click = fire,
  * hold 0.7 s = pause (with help; hold again in pause = back to title).
+ * In the demo, any turn or press goes back to the title.
  */
 
 #include <Arduino.h>
@@ -39,7 +41,17 @@ void updateHud();
 
 // Useful macros
 #define SWAP(a, b)            do { typeof(a) temp = a; a = b; b = temp; } while (0)
-#define sign(a, b)            (double) (a > b ? 1 : (b > a ? -1 : 0))
+
+// One enemy step towards the player on one axis (was sign(a, b) * ENEMY_SPEED).
+// The sign is read from the float's bits: one subtraction instead of two
+// float compares.
+static double __attribute__((noinline)) toward(double target, double from) {
+  float dlt = target - from;                     // float: double is 64-bit on the PC harness
+  uint32_t u;
+  memcpy(&u, &dlt, sizeof(u));
+  if (!(u << 1)) return 0;                       // +0 or -0: same axis position
+  return (u >> 31) ? -ENEMY_SPEED : ENEMY_SPEED;
+}
 
 void setup(void) {
   hardware_detect();                 // profile, settings (reads the button first)
@@ -89,6 +101,69 @@ static uint8_t rnd() {
   rngState ^= rngState >> 9;
   rngState ^= rngState << 8;
   return rngState;
+}
+
+// ================== Attract mode ==================
+// After DEMO_IDLE_MS without a turn or a press, on any screen, the game plays
+// itself: E1M1 and E1M2 in turn, a new demo after each death or level end, so
+// an unused module always shows something (and the OLED does not burn in).
+// Any turn or press goes back to the title. The demo writes no EEPROM.
+bool demo = false;
+static bool demoLevel = true;
+static int16_t aiSeenX;              // screen x of the nearest living imp in view
+static uint8_t aiSeenDist = 0;       // its distance (* DISTANCE_MULTIPLIER), 0 = none
+static bool    aiHit = false;        // the demo player ran into something this tick
+static uint8_t aiBump = 0;           // ticks in a row it did
+static uint8_t aiBlind = 0;          // ticks to ignore imps after getting stuck
+
+static void startDemo() {
+  demo = true;
+  levelID = demoLevel = !demoLevel;
+  num_entities = enemyCount = enemyCount2 = trapCount = r = rc1 = flash_screen = 0;
+  bss = EnemySpawn = del = reload1 = false;
+  z = 6;
+  difficulty = 1;
+  fade_e = true;
+  scene = GAME_PLAY;
+  exit_scene = true;
+#ifdef HOST
+  host_log("demo start, level", levelID);
+#endif
+}
+
+// Every waiting loop calls this.
+static void demoIfIdle() {
+  if (input_idle_ms() >= DEMO_IDLE_MS) startDemo();
+}
+
+// One game tick of the demo player. It aims with the screen position of the
+// nearest imp (renderEntities records it), avoids walls with the z-buffer of
+// the last frame, steers through steerPending (the encoder's easing) and sets
+// the cruise speed. Returns true to fire.
+static bool __attribute__((noinline)) aiTick() {
+  int8_t rot = 0;                                   // in 0.01 rad (one float op at the end)
+  int8_t thr = 3;                                   // explore at SPRINT
+  bool fire = false;
+  uint8_t d = aiSeenDist;
+  aiBump = aiHit ? aiBump + 1 : 0;
+  aiHit = false;
+  if (aiBump > 6) { aiBlind = 30; aiBump = 0; }     // stuck: wander off for 2 s
+  if (aiBlind) { aiBlind--; d = 0; }
+  if (d) {
+    int16_t err = aiSeenX - HALF_WIDTH;             // + = right of the crosshair
+    rot = constrain(-err, -25, 25);                 // 0.01 rad per pixel
+    bool gun = player.keys;                         // shotgun: close in to 2 units, back off
+    uint8_t range = gun ? 40 : ENEMY_MELEE_DIST;    // inside 0.8; fist: run into melee range
+    thr = d > range ? 2 : (gun && d < 16 ? -1 : 0);
+    fire = d < (gun ? 56 : ENEMY_MELEE_DIST + 1) && abs(err) < (gun ? 2 : 10);
+  } else if (zbuffer[ZBUFFER_SIZE / 2] < 26 || aiBump > 2) {
+    rot = zbuffer[2] > zbuffer[ZBUFFER_SIZE - 3] ? 30 : -30;   // turn to the open side
+  } else if (rnd() < 6) {
+    rot = (rnd() & 1) ? 80 : -80;                    // now and then a new heading
+  }
+  steerPending += rot * 0.01;
+  throttle = thr;
+  return fire;
 }
 
 // Jump to another scene
@@ -261,7 +336,7 @@ void fire() {
 
     Coords transform = translateIntoView(&(entity[i].pos));
     if (abs(transform.x) < 20 && transform.y > 0) {
-      uint8_t damage = (double) min(GUN_MAX_DAMAGE, GUN_MAX_DAMAGE / (abs(transform.x) * entity[i].distance) / 5);
+      uint8_t damage = (double) min(GUN_MAX_DAMAGE, (GUN_MAX_DAMAGE / 5.0) / (abs(transform.x) * entity[i].distance));
       uint8_t pct = pgm_read_byte((gun ? GUN_PCT : PUNCH_PCT) + difficulty - 1);
       damage = ((uint16_t)damage * pct / 100) / difficulty;
       if (damage > 0) {
@@ -362,8 +437,8 @@ void updateEntities(const uint8_t level[]) {
                   updatePosition(
                     level,
                     &(e.pos),
-                    sign(player.pos.x, e.pos.x) * ENEMY_SPEED,
-                    sign(player.pos.y, e.pos.y) * ENEMY_SPEED,
+                    toward(player.pos.x, e.pos.x),
+                    toward(player.pos.y, e.pos.y),
                     true
                   );
                 }
@@ -561,16 +636,19 @@ Coords translateIntoView(Coords *pos) {
   double sprite_y = pos->y - player.pos.y;
 
   // 1 / det(plane, dir). Rotation keeps the determinant at its start value
-  // 0.66 (dir (1,0), plane (0,-0.66)), so it is a constant.
+  // 0.66 (dir (1,0), plane (0,-0.66)), so it is a constant. The plane is
+  // always 0.66 * (dir.y, -dir.x), so the depth (inv_det * (-plane.y * sx +
+  // plane.x * sy)) is simply dir . s.
   const double inv_det = 1.0 / 0.66;
   double transform_x = inv_det * (player.dir.y * sprite_x - player.dir.x * sprite_y);
-  double transform_y = inv_det * (- player.plane.y * sprite_x + player.plane.x * sprite_y); // Z in screen
+  double transform_y = player.dir.x * sprite_x + player.dir.y * sprite_y; // Z in screen
 
   return { transform_x, transform_y };
 }
 
 void renderEntities(double view_height) {
   sortEntities();
+  aiSeenDist = 0;
 
   for (uint8_t i = 0; i < num_entities; i++) {
     if (entity[i].state == S_HIDDEN) continue;
@@ -589,6 +667,11 @@ void renderEntities(double view_height) {
     // don´t try to render if outside of screen
     if (sprite_screen_x < - HALF_WIDTH || sprite_screen_x > SCREEN_WIDTH + HALF_WIDTH) {
       continue;
+    }
+    // for the demo player: sorted far to near, so the last one is the nearest
+    if (type == E_ENEMY && entity[i].health) {
+      aiSeenX = sprite_screen_x;
+      aiSeenDist = entity[i].distance;
     }
 
     // All sprites are square: imp 32 px, fireball and items 16 px.
@@ -685,10 +768,18 @@ void updateHud() {
 }
 
 void softReset() {
-  sound_stop_timer();
+  // Wait for the release: a button still held at the restart would reach the
+  // power-up profile check in hardware_detect() (hold 0.6 s = next profile).
+  while (input_held()) {}
+  sound_stop_timer();                // also switches the DAC off
   noInterrupts();
 #ifdef HOST
   host_reset();
+#elif IS_LGT8F
+  // The app's own reset vector. The LGT8F bootloader moves it to 0x18 and puts
+  // a jump to itself at 0, where a soft reset would wait for its watchdog
+  // (1-2 s of frozen screen) before the game starts again.
+  asm volatile ("jmp 0x18");
 #else
   asm volatile ("jmp 0");
 #endif
@@ -738,6 +829,7 @@ void loopMid() {
       fade_e = true;
       jumpTo(mid < 3 ? GAME_PLAY : SCORE);
     }
+    demoIfIdle();
   }
 }
 
@@ -774,16 +866,17 @@ void loopScore() {
     if (input_fire()) {
       display.clearDisplay();
       display.display();
-      delay(1000);
+      wait_ms(1000);
       softReset();
     }
   }
   drawText(SCREEN_WIDTH / 0.99 - 40, SCREEN_HEIGHT * .5, a);
   display.display();
-  delay(30);
+  wait_ms(30);
 
   fade_e = false;
   jumpTo(SCORE);
+  demoIfIdle();
 }
 
 // Board info for the title screen, like the SCOPE splash: V2.5 LGT P3 DAC
@@ -821,6 +914,7 @@ void loopIntro() {
       sound_play(SFX_CONFIRM);
       jumpTo(DIFF);
     }
+    demoIfIdle();
   }
 }
 
@@ -857,6 +951,7 @@ void loopDiff() {
       fade_e = true;
       jumpTo(MUS);
     }
+    demoIfIdle();
   }
 }
 
@@ -905,6 +1000,7 @@ void loopSetup() {
       sound_play(SFX_CONFIRM);
       jumpTo(MUS);
     }
+    demoIfIdle();
   }
 }
 
@@ -925,18 +1021,19 @@ static void pauseGame() {
   sound_pause(true);
   display.clearDisplay();
   drawText(49, 2, F("PAUSED"));
-  drawLines(4, 14, F("TURN           LOOK\n"
-                     "HOLD AND TURN  SPEED\n"
-                     "CLICK          FIRE\n"
-                     "TRIG IN        FIRE\n"
-                     "HOLD           QUIT"), 8);
+  drawLines(4, 14, F("TURN\tLOOK\n"
+                     "HOLD AND TURN\tSPEED\n"
+                     "CLICK\tFIRE\n"
+                     "TRIG IN\tFIRE\n"
+                     "HOLD\tQUIT"), 8);
   drawText(26, 57, F("CLICK TO RESUME"));
   display.invertDisplay(false);
   display.display();
   input_clear();
-  while (true) {
+  while (!exit_scene) {
     if (input_fire()) break;
     if (input_long()) softReset();
+    demoIfIdle();                    // the gameplay loop then ends too
   }
   sound_pause(false);
   input_clear();
@@ -945,15 +1042,12 @@ static void pauseGame() {
 
 static const int8_t THROTTLE_SPEED[THROTTLE_MAX - THROTTLE_MIN + 1] PROGMEM = { -50, 0, 40, 70, 100 };  // % of MOV_SPEED
 
+// The speed name after a change; in the demo the box says DEMO instead.
+static const char SPEED_NAMES[] PROGMEM = "BACK\0\0\0STOP\0\0\0WALK\0\0\0RUN\0\0\0\0SPRINT\0DEMO";
 static void drawThrottle() {
   display.clearRect(0, 0, 32, 8);
-  switch (throttle) {
-    case -1: drawText(1, 1, F("BACK")); break;
-    case 0:  drawText(1, 1, F("STOP")); break;
-    case 1:  drawText(1, 1, F("WALK")); break;
-    case 2:  drawText(1, 1, F("RUN")); break;
-    default: drawText(1, 1, F("SPRINT")); break;
-  }
+  uint8_t i = demo ? 5 : throttle - THROTTLE_MIN;
+  drawText(1, 1, reinterpret_cast<const __FlashStringHelper *>(SPEED_NAMES + 7 * i));
 }
 
 void loopGamePlay() {
@@ -967,6 +1061,7 @@ void loopGamePlay() {
   bool stepLatch = false;
   bool dead = false;
   bool lastInvert = false;
+  uint8_t demoEnd = 0;
 
   initializeLevel(curLevel());
   if (levelID) z = 9;                // "GOAL-FIND EXIT" (never shown before)
@@ -984,8 +1079,14 @@ void loopGamePlay() {
     memset(display_buf, 0, SCREEN_WIDTH * (RENDER_HEIGHT / 8));
 
     // ---------- input, every frame ----------
-    if (input_fire() | input_trig()) fireLatch = 6;
-    if (input_long() && !dead) pauseGame();
+    if (demo) {
+      // any turn or press ends the demo (TRIG does not: the demo player fires)
+      if (input_idle_ms() < DEMO_IDLE_MS) softReset();
+    } else {
+      if (input_fire() | input_trig()) fireLatch = 6;
+      demoIfIdle();                  // before the pause: a demo started there must not restart here
+      if (input_long() && !dead) pauseGame();
+    }
 
     if (player.health > 0) {
       // Steering: counts turn the view directly, faster spins turn further.
@@ -1028,6 +1129,7 @@ void loopGamePlay() {
     if (tickAcc >= TICK_MS) tickAcc = 0;
 
     for (uint8_t t = 0; t < ticks && !exit_scene; t++) {
+      if (demo && player.health > 0 && aiTick()) fireLatch = 6;
       bool fireReq = fireLatch > 0;
       if (fireLatch) fireLatch--;
       bool hasShells = player.keys != 0;
@@ -1055,8 +1157,8 @@ void loopGamePlay() {
       }
       // Level 2: the exit
       if (levelID && cy == 55 && cx >= 12 && cx <= 22) {
-        mid = 3;
-        jumpTo(MID);
+        if (demo) startDemo();       // the demo skips story and score
+        else { mid = 3; jumpTo(MID); }
         break;
       }
       if (bss) {
@@ -1083,7 +1185,7 @@ void loopGamePlay() {
         double target = (int8_t)pgm_read_byte(THROTTLE_SPEED + throttle - THROTTLE_MIN) * (MOV_SPEED / 100);
         if (target != 0) player.velocity += (target - player.velocity) * .4;
         else player.velocity *= .5;
-        jogging = abs(player.velocity) * MOV_SPEED_INV * 2;
+        jogging = abs(player.velocity) * (MOV_SPEED_INV * 2);
 
         // Update gun
         if (gun_pos > GUN_TARGET_POS) {
@@ -1110,6 +1212,7 @@ void loopGamePlay() {
         // The player is dead
         if (!dead) {
           dead = true;
+          fireLatch = 0;               // a shot latched before death must not skip GAME OVER
           throttle = 0;
           sound_music(SONG_NONE);
           sound_play(SFX_DEATH);
@@ -1136,7 +1239,7 @@ void loopGamePlay() {
           fireLatch = 0;
           sound_music(SONG_NONE);
           sound_play(SFX_WIN);
-        } else if (fireReq) {
+        } else if (fireReq && !demo) {
           player.pos.x = 230;
           player.pos.y = 50;
           mid = 2;
@@ -1167,6 +1270,8 @@ void loopGamePlay() {
 
       if (fade > 0) fade--;
       if (throttleMsg) throttleMsg--;
+      // the demo starts over 3 s after a death or the end of E1M1
+      if (demo && (dead || del) && ++demoEnd > 45) startDemo();
 
       // flash screen
       if (flash_screen > 0) {
@@ -1180,12 +1285,9 @@ void loopGamePlay() {
     // ---------- movement, every frame ----------
     if (player.health > 0) {
       if (abs(player.velocity) > 0.003) {
-        updatePosition(
-          level,
-          &(player.pos),
-          player.dir.x * player.velocity * delta,
-          player.dir.y * player.velocity * delta
-        );
+        double step = player.velocity * delta;
+        bool bumped = updatePosition(level, &(player.pos), player.dir.x * step, player.dir.y * step);
+        if (bumped) aiHit = true;
       } else {
         player.velocity = 0;
       }
@@ -1201,7 +1303,7 @@ void loopGamePlay() {
     renderEntities(view_height);
     renderGun(gun_pos, jogging, gun_fired, rc1);
     if (fade > 0) fadeScreen(fade);
-    if (throttleMsg) drawThrottle();
+    if (throttleMsg || demo) drawThrottle();
     updateHud();
 
     // Draw the frame
@@ -1239,7 +1341,7 @@ void loop(void) {
     for (uint8_t i = 0; i < GRADIENT_COUNT; i++) {
       fadeScreen(i, 0);
       display.display();
-      delay(40);
+      wait_ms(40);
     }
   }
   exit_scene = false;

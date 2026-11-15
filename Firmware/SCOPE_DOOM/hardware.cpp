@@ -1,7 +1,36 @@
 #include <Arduino.h>
-#include <EEPROM.h>
 #include "hardware.h"
 #include "constants.h"
+#include "input.h"
+
+#if IS_LGT8F && !defined(HOST)
+// The lgt8fx E2PROM library cost about 230 bytes of flash for these few
+// accesses. The same register sequences as its lgt_eeprom_init(1) /
+// read_byte / write_byte: 1 KB emulation, where the address the sketch uses is
+// the real address (below 1020).
+static void eeInit() { ECCR = 0x80; ECCR = 0x4C; }
+static uint8_t eeRead(uint16_t a) {
+  EEARL = a;
+  EEARH = a >> 8;
+  EECR |= _BV(EERE);
+  asm volatile ("nop\n\tnop");
+  return EEDR;
+}
+static void eeUpdate(uint16_t a, uint8_t v) {
+  if (eeRead(a) == v) return;          // EEAR stays set
+  EEDR = v;
+  uint8_t s = SREG;
+  cli();
+  EECR = 0x04;
+  EECR = 0x02;
+  SREG = s;
+}
+#else
+#include <EEPROM.h>
+static void eeInit() {}
+#define eeRead(a)      EEPROM.read(a)
+#define eeUpdate(a, v) EEPROM.update(a, v)
+#endif
 
 // Same byte and meaning as the SCOPE firmware (SCOPEv2.ino, v3.8):
 // bit0 = v2.5 display wiring, bit1 = v2.5 encoder wiring, >3 = autodetect.
@@ -43,17 +72,20 @@ void hardware_detect() {
 
   // Hardware profile, exactly as in the SCOPE firmware. Holding the encoder
   // during power-up steps to the next profile and stores it - the way out when
-  // the wrong display pins leave the screen dark. The LGT8F's emulated EEPROM is
-  // erased by every upload, so after flashing it starts on autodetect again.
+  // the wrong display pins leave the screen dark. This byte is SCOPE's own: an
+  // upload does not erase the LGT8F's emulated EEPROM (measured; the bootloader
+  // only erases the flash pages it writes), so DOOM starts on the profile the
+  // scope firmware used, and SCOPE gets back whatever is chosen here.
+  eeInit();
   delayMicroseconds(200);
-  hwProfile = EEPROM.read(EEPROM_HWPROFILE_ADDR);
+  hwProfile = eeRead(EEPROM_HWPROFILE_ADDR);
   if (BUTTON_DOWN()) {
-    delay(600);                                    // ignore a brushed encoder
+    wait_ms(600);                                   // ignore a brushed encoder
     if (BUTTON_DOWN()) {
       hwProfile = (hwProfile > 3) ? 3 : ((hwProfile + 1) & 3);
-      EEPROM.update(EEPROM_HWPROFILE_ADDR, hwProfile);
+      eeUpdate(EEPROM_HWPROFILE_ADDR, hwProfile);
       while (BUTTON_DOWN()) {}                     // the release must not fire
-      delay(50);
+      wait_ms(50);
     }
   }
   if (hwProfile <= 3) {
@@ -68,16 +100,16 @@ void hardware_detect() {
   // stay off or it fights the encoder contact and browns the board out.
   hwHasDac = IS_LGT8F && hwEncoderV25;
 
-  if (EEPROM.read(EEPROM_DOOM_MAGIC_ADDR) == EEPROM_DOOM_MAGIC) {
-    setSound = EEPROM.read(EEPROM_DOOM_SOUND_ADDR);
+  if (eeRead(EEPROM_DOOM_MAGIC_ADDR) == EEPROM_DOOM_MAGIC) {
+    setSound = eeRead(EEPROM_DOOM_SOUND_ADDR);
     if (setSound > 2) setSound = 2;
-    setSteer = (EEPROM.read(EEPROM_DOOM_STEER_ADDR) == 0xFF) ? -1 : 1;
+    setSteer = (eeRead(EEPROM_DOOM_STEER_ADDR) == 0xFF) ? -1 : 1;
   }
   if (!hwHasDac) setSound = 0;
 }
 
 void settings_save() {
-  EEPROM.update(EEPROM_DOOM_MAGIC_ADDR, EEPROM_DOOM_MAGIC);
-  if (hwHasDac) EEPROM.update(EEPROM_DOOM_SOUND_ADDR, setSound);  // keep the choice for a DAC profile
-  EEPROM.update(EEPROM_DOOM_STEER_ADDR, (uint8_t)setSteer);
+  eeUpdate(EEPROM_DOOM_MAGIC_ADDR, EEPROM_DOOM_MAGIC);
+  if (hwHasDac) eeUpdate(EEPROM_DOOM_SOUND_ADDR, setSound);  // keep the choice for a DAC profile
+  eeUpdate(EEPROM_DOOM_STEER_ADDR, (uint8_t)setSteer);
 }

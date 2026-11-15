@@ -283,6 +283,7 @@ void drawLines(int8_t x, int8_t y, const __FlashStringHelper *txt_p, uint8_t dy 
   char ch;
   while ((ch = pgm_read_byte(p++)) != '\0') {
     if (ch == '\n') { y += dy; cx = x; continue; }
+    if (ch == '\t') { cx = x + 15 * (CHAR_WIDTH + 1); continue; }   // second column
     if (cx < SCREEN_WIDTH) drawChar(cx, y, ch);
     cx += CHAR_WIDTH + 1;
   }
