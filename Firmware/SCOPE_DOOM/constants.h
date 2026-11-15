@@ -95,7 +95,7 @@
 constexpr uint8_t SCREEN_WIDTH     =  128;
 constexpr uint8_t SCREEN_HEIGHT    =  64;
 constexpr uint8_t HALF_WIDTH       =  SCREEN_WIDTH/2;
-constexpr uint8_t RENDER_HEIGHT    =  56;         // raycaster working height (the rest is for the hud)
+constexpr uint8_t RENDER_HEIGHT    =  48;         // raycaster working height (the rest is the status bar; a multiple of 8)
 constexpr uint8_t HALF_HEIGHT      =  SCREEN_HEIGHT/2;
 
 #endif

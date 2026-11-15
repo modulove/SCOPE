@@ -22,6 +22,10 @@ boards with a Nano and on v2 (green) boards, but without sound (see
 The shotgun takes shells. With none left you punch. Kill 20 imps on the
 first level, then find the exit of the second.
 
+The status bar under the view shows your health (cross, left) and shells
+(right) in large digits. Between them a short message (goal, kill count,
+pickups) appears for 3 seconds. GAME OVER and YOU WIN stay until you click.
+
 ## Demo (attract mode)
 
 Leave the module alone for **one minute**, on any screen or in the middle of a

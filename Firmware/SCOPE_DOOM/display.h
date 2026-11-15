@@ -22,8 +22,8 @@ uint8_t getByte(uint8_t x, uint8_t y);
 void drawPixel(int8_t x, int8_t y, bool color, bool raycasterViewport);
 void drawVLine(uint8_t x, int8_t start_y, int8_t end_y, uint8_t intensity);
 void drawSprite(int16_t x, int8_t y, const uint8_t bitmap[], const uint8_t mask[], int16_t w, int16_t h, uint8_t sprite, double distance);
-void drawChar(int8_t x, int8_t y, char ch);
-void drawText(int8_t x, int8_t y, char *txt, uint8_t space = 1);
+void drawChar(int8_t x, int8_t y, char ch, uint8_t s = 1);
+void drawText(int8_t x, int8_t y, char *txt, uint8_t space = 1, uint8_t s = 1);
 void drawText(int8_t x, int8_t y, const __FlashStringHelper txt, uint8_t space = 1);
 
 // SCOPE OLED, SPI (see SSD1306.cpp for the two wirings)
@@ -228,35 +228,34 @@ void drawSprite(
 
 // Draw a single character.
 // Made for a custom font with some useful sprites. Char size 4 x 6
-// Uses less memory than display.print()
-void drawChar(int8_t x, int8_t y, char ch) {
+// Uses less memory than display.print(). s = scale: 1, or 2 (8 x 12, status bar).
+void drawChar(int8_t x, int8_t y, char ch, uint8_t s) {
   uint8_t c = 0;
-  uint8_t n;
-  uint8_t bOffset;
-  uint8_t b;
-  uint8_t line = 0;
 
   // Find the character
   while (CHAR_MAP[c] != ch && CHAR_MAP[c] != '\0') c++;
 
-  bOffset = c / 2;
-  for (; line < CHAR_HEIGHT; line++) {
-    b = pgm_read_byte(bmp_font + (line * bmp_font_width + bOffset));
-    for (n = 0; n < CHAR_WIDTH; n++)
-      if (read_bit(b, (c % 2 == 0 ? 0 : 4) + n))
-        drawPixel(x + n, y + line, 1, false);
+  for (uint8_t line = 0; line < CHAR_HEIGHT; line++) {
+    // two characters per byte, the left one in the high nibble
+    uint8_t b = pgm_read_byte(bmp_font + (line * bmp_font_width + c / 2));
+    if (c & 1) b <<= 4;
+    b &= 0xF0;
+    for (int8_t px = x; b; b <<= 1, px += s)       // MSB = leftmost pixel
+      if (b & 0x80)
+        for (uint8_t k = 0; k < s * s; k++)
+          drawPixel(px + (k & 1), y + line * s + (k >> 1), 1, false);
   }
 }
 
 // Draw a string
-void drawText(int8_t x, int8_t y, char *txt, uint8_t space) {
+void drawText(int8_t x, int8_t y, char *txt, uint8_t space, uint8_t s) {
   uint8_t pos = x;
   uint8_t i = 0;
   char ch;
   while ((ch = txt[i]) != '\0') {
-    drawChar(pos, y, ch);
+    drawChar(pos, y, ch, s);
     i++;
-    pos += CHAR_WIDTH + space;
+    pos += (CHAR_WIDTH + space) * s;
 
     // shortcut on end of screen
     if (pos > SCREEN_WIDTH) return;
@@ -291,8 +290,8 @@ void drawLines(int8_t x, int8_t y, const __FlashStringHelper *txt_p, uint8_t dy 
 
 // Draw an integer. The submission's 4-byte buffer ("3 digit max") overflowed
 // the stack on the score screen, where scores have 4-5 digits.
-void drawText(uint8_t x, uint8_t y, int16_t num) {
+void drawText(uint8_t x, uint8_t y, int16_t num, uint8_t s = 1) {
   char buf[7]; // "-32768" + \0
   itoa(num, buf, 10);
-  drawText(x, y, buf);
+  drawText(x, y, buf, 1, s);
 }

@@ -68,6 +68,13 @@ bool exit_scene = false;
 bool invert_screen = false;
 uint8_t flash_screen = 0;
 uint8_t z = 6;                       // HUD message, see updateHud()
+static uint16_t zTime;               // millis() when it was set; shown for HUD_MSG_MS
+#define HUD_MSG_MS 3000
+static const uint8_t SHELLS[3] PROGMEM = { 13, 10, 9 };   // per pickup, by difficulty
+static void hudMsg(uint8_t m) {
+  z = m;
+  zTime = millis();
+}
 uint8_t difficulty = 1;
 uint8_t rc1 = 0;                     // gun sprite: 0 gun, 1/2 reload frames, 3 none
 int16_t a = 0;                       // score count-up
@@ -122,7 +129,6 @@ static void startDemo() {
   levelID = demoLevel = !demoLevel;
   num_entities = enemyCount = enemyCount2 = trapCount = r = rc1 = flash_screen = 0;
   bss = EnemySpawn = del = reload1 = false;
-  z = 6;
   difficulty = 1;
   fade_e = true;
   scene = GAME_PLAY;
@@ -292,7 +298,7 @@ UID detectCollision(const uint8_t level[], Coords *pos, double relative_x, doubl
     if (block == E_DOOR3) flag = &player.secret3;
     if (flag && !*flag) {
       *flag = 1;
-      z = 8;
+      hudMsg(8);
       sound_play(SFX_SECRET);
     }
   }
@@ -337,7 +343,7 @@ static const uint8_t PUNCH_PCT[3] PROGMEM = { 125,  90, 60 };
 void fire() {
   bool gun = player.keys != 0;
   bool hit = false;
-  z = 3;
+  hudMsg(3);
   for (uint8_t i = 0; i < num_entities; i++) {
     // Shoot only ALIVE enemies
     if (uid_get_type(entity[i].uid) != E_ENEMY || entity[i].state == S_DEAD || entity[i].state == S_HIDDEN) {
@@ -411,7 +417,7 @@ void updateEntities(const uint8_t level[]) {
               e.a = true;
               if (bss) { if (enemyCount2 < 8) enemyCount2++; EnemySpawn = true; }
               else if (enemyCount < 20) enemyCount++;   // one blast can kill several
-              z = 7;
+              hudMsg(7);
               sound_play(SFX_ENEMY_DIE);
             }
             if (e.state != S_DEAD) {
@@ -504,7 +510,7 @@ void updateEntities(const uint8_t level[]) {
             static const uint8_t HEAL[3] PROGMEM = { 65, 50, 25 };
             player.health = min(100, player.health + pgm_read_byte(HEAL + difficulty - 1));
             flash_screen = 1;
-            z = 2;
+            hudMsg(2);
             sound_play(SFX_MEDKIT);
           }
           break;
@@ -514,9 +520,8 @@ void updateEntities(const uint8_t level[]) {
           if (e.distance < ITEM_COLLIDER_DIST && player.keys < 240) {
             // pickup
             e.state = S_HIDDEN;
-            static const uint8_t SHELLS[3] PROGMEM = { 13, 10, 9 };
             player.keys = min(240, player.keys + pgm_read_byte(SHELLS + difficulty - 1));
-            z = 1;
+            hudMsg(1);
             sound_play(SFX_SHELLS);
           }
           break;
@@ -740,43 +745,48 @@ void renderGun(uint8_t gun_pos, double amount_jogging, bool gun_fired, uint8_t r
   display.drawBitmap(x + ox, y + oy, bits, w, clip_height, 1);
 }
 
-// Render values for the HUD
+// The status bar under the 3D view: health (left) and shells (right) in double
+// size, between them a short message for HUD_MSG_MS. GAME OVER and YOU WIN
+// are set again every tick, so they stay.
+static uint8_t __attribute__((noinline)) digits(uint8_t v) { return 1 + (v > 9) + (v > 99); }
 void updateHud() {
-  display.clearRect(0, 58, 128, 6);
+  display.clearRect(0, RENDER_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT - RENDER_HEIGHT);
+  uint8_t hp = player.health, sh = player.keys;
+  drawText(1, 54, F("{}"), 0);                       // health symbol
+  drawText(11, 51, (int16_t)hp, 2);
+  uint8_t sx = 129 - 10 * digits(sh);                // right-aligned
+  drawText(sx - 10, 54, F("[]"), 0);                 // shells symbol
+  drawText(sx, 51, (int16_t)sh, 2);
 
-  const __FlashStringHelper *msg = nullptr;
-  uint8_t mx = 31;
+  if ((uint16_t)millis() - zTime >= HUD_MSG_MS) return;
+  int16_t n = -1;                                    // a number before the text
+  PGM_P msg = nullptr;
   switch (z) {
-    case 1: {
-        static const uint8_t SHELLS_X[3] PROGMEM = { 57, 57, 60 };
-        static const uint8_t SHELLS_N[3] PROGMEM = { 13, 10, 9 };
-        drawText(31, 58, F("FOUND "));
-        drawText(65, 58, F(" SHELLS"));
-        drawText(pgm_read_byte(SHELLS_X + difficulty - 1), 58, (int16_t)pgm_read_byte(SHELLS_N + difficulty - 1));
-      } break;
-    case 2: msg = F("FOUND A MEDKIT"); break;
-    case 4: mx = 38; msg = F("GAME OVER"); break;
-    case 5: mx = 44; msg = F("YOU WIN"); break;
-    case 6: mx = 33; msg = F("GOAL-20 KILLS"); break;
+    case 1: n = pgm_read_byte(SHELLS + difficulty - 1); msg = PSTR("SHELLS"); break;
+    case 2: msg = PSTR("MEDKIT"); break;
+    case 4: msg = PSTR("GAME OVER"); break;
+    case 5: msg = PSTR("YOU WIN"); break;
+    case 6: msg = PSTR("KILL 20"); break;
     case 7:
-      if (levelID && bss) {
-        drawText(37, 58, (int16_t)enemyCount2);
-        mx = 52; msg = F("OUT OF 8");
-      } else if (!levelID) {
-        drawText(37, 58, (int16_t)enemyCount);
-        mx = 52; msg = F("OUT OF 20");
-      }
+      if (levelID && bss) { n = enemyCount2; msg = PSTR("OF 8"); }
+      else if (!levelID)  { n = enemyCount;  msg = PSTR("OF 20"); }
       break;
-    case 8: mx = 35; msg = F("SECRET FOUND"); break;
-    case 9: msg = F("GOAL-FIND EXIT"); break;
-    default: break;              // 3 = no message
+    case 8: msg = PSTR("SECRET"); break;
+    case 9: msg = PSTR("FIND EXIT"); break;
+    default: return;             // 3 = no message
   }
-  if (msg) drawText(mx, 58, msg);
-
-  drawText(2, 58, F("{}"), 0);   // health symbol
-  drawText(103, 58, F("[]"), 0); // shells symbol
-  drawText(12, 58, (int16_t)player.health);
-  drawText(113, 58, (int16_t)player.keys);
+  if (!msg) return;
+  char buf[12];                  // at most 9 characters fit between the numbers
+  char *p = buf;
+  if (n >= 0) {
+    itoa(n, buf, 10);
+    p += strlen(buf);
+    *p++ = ' ';
+  }
+  strcpy_P(p, msg);
+  // centred in the gap between the health number and the shells symbol
+  uint8_t mx = 10 * digits(hp) + sx - 5 * (uint8_t)strlen(buf);
+  drawText(mx >> 1, 54, buf);
 }
 
 void softReset() {
@@ -857,24 +867,18 @@ void loopScore() {
 
   display.clearDisplay();
 
-  display.drawBitmap(
-    (SCREEN_WIDTH - BMP_LOGO_WIDTH) / 2 - 27,
-    (SCREEN_HEIGHT - BMP_LOGO_HEIGHT) / 6,
-    bmp_logo_bits,
-    BMP_LOGO_WIDTH,
-    BMP_LOGO_HEIGHT,
-    1
-  );
-  drawText(SCREEN_WIDTH / 2.36 - 52, SCREEN_HEIGHT * .79, F("NANO BRUTALITY"));
-  drawText(SCREEN_WIDTH / 0.99 - 45, SCREEN_HEIGHT * .2, F("YOU WIN"));
-  drawText(SCREEN_WIDTH / 0.99 - 40, SCREEN_HEIGHT * .4, F("SCORE"));
+  // YOU WIN and the score in double size, everything centred
+  char buf[8];
+  strcpy_P(buf, PSTR("YOU WIN"));
+  drawText(30, 4, buf, 1, 2);
+  drawText(52, 22, F("SCORE"));
   if (a < score) {
     a = min(score, a + 155);
     if (!(++clicks & 3)) sound_play(SFX_MENU);       // tally clicks
     if (a == score) sound_play(SFX_WIN);
   } else {
     a = score;
-    drawText(SCREEN_WIDTH / 0.99 - 52, SCREEN_HEIGHT * .91, F("PRESS FIRE"));
+    drawText(39, 54, F("PRESS FIRE"));
     if (input_fire()) {
       display.clearDisplay();
       display.display();
@@ -882,7 +886,8 @@ void loopScore() {
       softReset();
     }
   }
-  drawText(SCREEN_WIDTH / 0.99 - 40, SCREEN_HEIGHT * .5, a);
+  itoa(a, buf, 10);
+  drawText(65 - strlen(buf) * 5, 31, buf, 1, 2);
   display.display();
   wait_ms(30);
 
@@ -891,19 +896,16 @@ void loopScore() {
   demoIfIdle();
 }
 
-// Intro screen
+// Intro screen: the logo with PRESS FIRE under it, centred as one block
 void loopIntro() {
   display.drawBitmap(
-    (SCREEN_WIDTH - BMP_LOGO_WIDTH) / 2,
-    (SCREEN_HEIGHT - BMP_LOGO_HEIGHT) / 6,
+    (SCREEN_WIDTH - BMP_LOGO_WIDTH) / 2, 10,
     bmp_logo_bits,
     BMP_LOGO_WIDTH,
     BMP_LOGO_HEIGHT,
     1
   );
-
-  drawText(SCREEN_WIDTH / 4.6 - 25, SCREEN_HEIGHT * .3, F("PRESS"));
-  drawText(SCREEN_WIDTH / 0.99 - 25, SCREEN_HEIGHT * .3, F("FIRE"));
+  drawText(39, 48, F("PRESS FIRE"));
   display.display();
 
   levelID = false;
@@ -1063,7 +1065,7 @@ void loopGamePlay() {
   uint8_t demoEnd = 0;
 
   initializeLevel(curLevel());
-  if (levelID) z = 9;                // "GOAL-FIND EXIT" (never shown before)
+  hudMsg(levelID ? 9 : 6);           // the level goal (also for each new demo)
   throttle = 0;
   steerPending = 0;
   sound_music(SONG_LEVEL);
@@ -1216,7 +1218,7 @@ void loopGamePlay() {
           sound_music(SONG_NONE);
           sound_play(SFX_DEATH);
         }
-        z = 4;
+        hudMsg(4);
         player.velocity = 0;
         jogging = 0;
         if (view_height > -5) view_height--;
@@ -1232,7 +1234,7 @@ void loopGamePlay() {
       // shotgun blast that killed two imps at 19 kills skipped 20 and the level
       // could never be finished.)
       if (enemyCount == 20 && !levelID) {
-        z = 5;
+        hudMsg(5);
         if (!del) {
           del = true;
           fireLatch = 0;
@@ -1243,7 +1245,7 @@ void loopGamePlay() {
           player.pos.y = 50;
           mid = 2;
           enemyCount = 0;
-          z = 3;
+          hudMsg(3);
           jumpTo(MID);
           break;
         }
