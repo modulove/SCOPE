@@ -79,6 +79,14 @@ Which DAC the firmware uses depends on the board:
 
 `Firmware/SCOPE_DEBUG` is a debugging build of the v1 firmware.
 
+`Firmware/SCOPE_DOOM` is a game for v2 / v2.5: Doom Nano Brutality on the OLED,
+steered with the encoder (hold + turn sets the walking speed, click fires, so does
+the TRIG jack). On LGT8F328P boards it plays sound effects and music on CV OUT;
+like GEN, that needs the DAC jumper on the LGT8F side, and sound stays off until
+you switch it on in the game's SETUP screen. See its
+[README](Firmware/SCOPE_DOOM/README.md). Flashing it (or anything else) erases the
+LGT8F's emulated EEPROM, so redo `DAC Gn` / `DAC Ofs` after going back to the scope.
+
 ## Firmware
 
 **Easiest:** flash from the browser (Chrome, Edge or Opera) at **[dl.modulove.io/scope](https://dl.modulove.io/scope/)** — pick *Nano*, *Nano (old bootloader)* or *LGT8F328P* to match your board. Disconnect Eurorack power before plugging in USB.
