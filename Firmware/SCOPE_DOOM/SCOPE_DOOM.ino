@@ -112,6 +112,7 @@ bool demo = false;
 static bool demoLevel = true;
 static int16_t aiSeenX;              // screen x of the nearest living imp in view
 static uint8_t aiSeenDist = 0;       // its distance (* DISTANCE_MULTIPLIER), 0 = none
+static bool    aiFresh = false;      // a new frame was drawn since the last aim correction
 static bool    aiHit = false;        // the demo player ran into something this tick
 static uint8_t aiBump = 0;           // ticks in a row it did
 static uint8_t aiBlind = 0;          // ticks to ignore imps after getting stuck
@@ -149,16 +150,26 @@ static bool __attribute__((noinline)) aiTick() {
   aiHit = false;
   if (aiBump > 6) { aiBlind = 30; aiBump = 0; }     // stuck: wander off for 2 s
   if (aiBlind) { aiBlind--; d = 0; }
+  // Turn only on a freshly drawn frame: below 15 fps several ticks share one
+  // frame, and correcting again from the same picture overshoots (at 5 fps the
+  // aim never settled and the demo player never fired).
+  bool fresh = aiFresh;
+  aiFresh = false;
   if (d) {
     int16_t err = aiSeenX - HALF_WIDTH;             // + = right of the crosshair
-    rot = constrain(-err, -25, 25);                 // 0.01 rad per pixel
+    if (fresh) rot = constrain(-err, -25, 25);      // 0.01 rad per pixel
     bool gun = player.keys;                         // shotgun: close in to 2 units, back off
     uint8_t range = gun ? 40 : ENEMY_MELEE_DIST;    // inside 0.8; fist: run into melee range
     thr = d > range ? 2 : (gun && d < 16 ? -1 : 0);
-    fire = d < (gun ? 56 : ENEMY_MELEE_DIST + 1) && abs(err) < (gun ? 2 : 10);
-  } else if (zbuffer[ZBUFFER_SIZE / 2] < 26 || aiBump > 2) {
+    // Shotgun: fire when fire() would do real damage. Its damage is
+    // 16 / (|x offset| * distance), x1.5 on the demo's skill; with the offset
+    // err * depth / 64 and distance ~ 20 * depth, "at least 6" is
+    // |err| * d * d < 3200: centred up to 5 units, 1 px off up to 2.8, 3 px up
+    // to 1.5. Fist: in melee range and roughly in front.
+    fire = gun ? d < 100 && (uint32_t)abs(err) * d * d < 3200 : d <= ENEMY_MELEE_DIST && abs(err) < 10;
+  } else if (fresh && (zbuffer[ZBUFFER_SIZE / 2] < 26 || aiBump > 2)) {
     rot = zbuffer[2] > zbuffer[ZBUFFER_SIZE - 3] ? 30 : -30;   // turn to the open side
-  } else if (rnd() < 6) {
+  } else if (fresh && rnd() < 6) {
     rot = (rnd() & 1) ? 80 : -80;                    // now and then a new heading
   }
   steerPending += rot * 0.01;
@@ -649,6 +660,7 @@ Coords translateIntoView(Coords *pos) {
 void renderEntities(double view_height) {
   sortEntities();
   aiSeenDist = 0;
+  aiFresh = true;
 
   for (uint8_t i = 0; i < num_entities; i++) {
     if (entity[i].state == S_HIDDEN) continue;
@@ -879,17 +891,6 @@ void loopScore() {
   demoIfIdle();
 }
 
-// Board info for the title screen, like the SCOPE splash: V2.5 LGT P3 DAC
-static void drawHardwareInfo(uint8_t y) {
-  drawText(2, y, hwDisplayV25 ? F("V2.5") : F("V2"));
-  drawText(24, y, IS_LGT8F ? F("LGT") : F("328"));
-  if (hwProfile <= 3) {
-    drawText(42, y, F("P"));
-    drawText(47, y, (int16_t)hwProfile);
-  }
-  if (hwHasDac) drawText(56, y, F("DAC"));
-}
-
 // Intro screen
 void loopIntro() {
   display.drawBitmap(
@@ -901,10 +902,8 @@ void loopIntro() {
     1
   );
 
-  drawText(SCREEN_WIDTH / 2.36 - 25, SCREEN_HEIGHT * .79, F("NANO BRUTALITY"));
   drawText(SCREEN_WIDTH / 4.6 - 25, SCREEN_HEIGHT * .3, F("PRESS"));
   drawText(SCREEN_WIDTH / 0.99 - 25, SCREEN_HEIGHT * .3, F("FIRE"));
-  drawHardwareInfo(SCREEN_HEIGHT * .91);
   display.display();
 
   levelID = false;

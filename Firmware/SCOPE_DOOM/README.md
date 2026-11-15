@@ -62,8 +62,7 @@ OUT jack, just like SCOPE's GEN, RND, CLK and REF modes.
 ## Hardware profile
 
 The OLED and encoder wiring differ between hardware revisions. Doom picks the
-wiring exactly like the SCOPE firmware does. The bottom line of the title
-screen shows the result, for example `V2.5 LGT DAC`.
+wiring exactly like the SCOPE firmware does.
 
 If the display stays dark, **hold the encoder while powering up**. Each hold
 steps to the next of the four profiles (`P0`–`P3`), and the choice is stored.
