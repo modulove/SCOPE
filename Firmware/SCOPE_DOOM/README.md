@@ -95,8 +95,9 @@ fills the LGT8F's 29,696 bytes to 99 %.
 - *Doom Nano* by Dave Ruiz (github.com/daveruiz/doom-nano): raycaster,
   sprites, font.
 - *Doom Nano Brutality*: second level, story, reload animation, boss arena.
-- SCOPE adaptation submitted by a user. LGT8F/v2.5 port, sound engine,
-  encoder control and fixes by Modulove.
+- SCOPE adaptation (encoder controls, v2 pins) by **pearin**, a SCOPE user,
+  who sent it in. LGT8F/v2.5 port, sound engine, attract mode and fixes by
+  Modulove.
 - `SSD1306.*` is a trimmed copy of Adafruit's SSD1306 library (BSD licence,
   notice kept in the file).
 - The encoder is read with the PJRC Encoder library (MIT).
